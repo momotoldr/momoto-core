@@ -1,0 +1,412 @@
+// Prisma schema for Momoto accounts.
+//
+// Postgres in every environment. Prisma's `provider` must be a literal (it can't be
+// driven by an env var), and a migration history is provider-specific — so dev and
+// prod share one provider rather than drifting. Point DATABASE_URL at a local
+// Postgres, a Docker container, or a free hosted dev branch (e.g. a Neon branch).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Account privilege level. `USER` is the default for every account (public app);
+/// `ADMIN` unlocks the read-only monitoring surface (`/admin/*`). Promotion is a
+/// deliberate operator action via `npm run make-admin` — never self-service.
+enum Role {
+  USER
+  ADMIN
+}
+
+/// A registered user. `passwordHash` is null for Google-only accounts; `googleId`
+/// is null for email/password-only accounts (an account can have both once linked).
+model User {
+  id              String    @id @default(cuid())
+  username        String    @unique
+  /// The account's **proven** address, or null. Accounts sign in with a username;
+  /// this is how they get back in when the password is gone.
+  ///
+  /// Nothing writes this column on the strength of someone merely typing an address.
+  /// A claim lives on `EmailVerificationToken` until the link in it is opened — see
+  /// that model for why. The two exceptions are documented and deliberate:
+  /// Google sign-in (`auth/google.ts` rejects a token without `email_verified`, so
+  /// Google did the proving) and `POST /admin/users`, where an operator types it and
+  /// `emailVerifiedAt` is therefore left null.
+  email           String?   @unique
+  /// When `email` was proven. Null means the address is unproven, not absent —
+  /// an admin-minted account has one and hasn't confirmed it.
+  ///
+  /// This gates exactly one thing: whether a password-reset link may be mailed.
+  /// It does **not** gate sign-in, the booth, or checkout; an unproven address costs
+  /// the user a banner, never access.
+  emailVerifiedAt DateTime?
+  passwordHash    String?
+  displayName     String
+  /// A picture hosted elsewhere. **Set by Google sign-in only** — users upload
+  /// through `avatarImage` instead, so this is never an arbitrary user-supplied URL
+  /// (which would load in the partner's browser and leak their IP to its host).
+  avatarUrl       String?
+  /// When the uploaded avatar last changed. A plain column rather than a lookup
+  /// through the relation, so serializing a user never needs the image bytes: it is
+  /// both the "has an upload" flag and the cache-buster in the avatar URL.
+  avatarUpdatedAt DateTime?
+  /// Object-storage key for the uploaded avatar, in the **public** bucket.
+  ///
+  /// On the user row rather than on `AvatarImage` for one reason: `serializeUser` is
+  /// synchronous and runs on login, refresh and every `/auth/me`, so the picture's
+  /// URL has to be derivable from a row we already loaded. A key here turns that into
+  /// a string concatenation against the CDN origin; a key on the relation would put a
+  /// join on the hottest paths in the API.
+  ///
+  /// Null means "no uploaded avatar in the bucket" — either the user has none at all
+  /// (`avatarUpdatedAt` is null too) or theirs is a pre-storage row whose bytes are
+  /// still in `avatarImage` (see that model).
+  avatarKey       String?
+  googleId        String?   @unique
+  /// Privilege level. Defaults to USER; ADMIN is set only via `npm run make-admin`.
+  role            Role      @default(USER)
+  /// Where the person lives, set only by them on their profile. Null = not given.
+  /// ISO 3166-1 alpha-2; 'ID' always comes with a `regionCode`. Shown publicly only on a
+  /// testimonial an admin publishes. The three columns are kept consistent by CHECK
+  /// constraints in the migration, not just by `PATCH /auth/me`.
+  countryCode     String?
+  /// Kemendagri kabupaten/kota code ("32.73"), from `src/data/regions-id.json`. Set
+  /// exactly when `countryCode` is 'ID'.
+  regionCode      String?
+  /// Free-text city abroad ("Tokyo"). Only when `countryCode` isn't 'ID'; optional.
+  cityName        String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  // Partner linking — a mutual one-to-one couple link (see partner routes). When
+  // linked, both users' partnerId point at each other; unlinking clears both.
+  partnerId String? @unique
+  partner   User?   @relation("Partnership", fields: [partnerId], references: [id], onDelete: SetNull)
+  partnerOf User?   @relation("Partnership")
+
+  refreshTokens      RefreshToken[]
+  emailVerifications EmailVerificationToken[]
+  passwordResets     PasswordResetToken[]
+  partnerInvites     PartnerInvite[]          @relation("Inviter")
+  avatarImage        AvatarImage?
+  strips             Strip[]
+  payments           Payment[]
+  feedbacks          Feedback[]               @relation("FeedbackAuthor")
+  partnerFeedbacks   Feedback[]               @relation("FeedbackPartner")
+  testimonials       Testimonial[]            @relation("TestimonialAuthor")
+  featuredWith       Testimonial[]            @relation("TestimonialPartner")
+  enteredFeedbacks   Feedback[]               @relation("FeedbackEnteredBy")
+}
+
+/// A feedback or support message from the app: the floating feedback button, or the
+/// star rating offered beside a finished strip (which may carry no message at all).
+///
+/// `userId` is optional — both are available on public pages — and is set
+/// null (rather than cascading) if the account is later deleted, so the message is
+/// kept for triage. `category` is free-form ("feedback" | "support") to avoid an
+/// enum migration if the set changes.
+model Feedback {
+  id            String    @id @default(cuid())
+  /// Short, human-referenceable ticket number (auto-incrementing). Assigned to every
+  /// row, but only surfaced in the admin console for support requests, where an
+  /// operator needs something short to quote back to the user.
+  ticketNumber  Int       @unique @default(autoincrement())
+  userId        String?
+  user          User?     @relation("FeedbackAuthor", fields: [userId], references: [id], onDelete: SetNull)
+  category      String
+  /// Optional 1–5 satisfaction rating.
+  rating        Int?
+  /// Empty string when the row is a rating on its own (the star rating beside a
+  /// finished strip is one tap, with no comment attached).
+  message       String
+  /// Optional reply-to address (prefilled from the account when signed in).
+  email         String?
+  /// Where it was sent from (a page path) — a client-supplied triage hint.
+  context       String?
+  userAgent     String?
+  createdAt     DateTime  @default(now())
+  /// When an admin marked this message handled (null = still open). Set from the
+  /// admin console; the acting admin is recorded in the server log, not here.
+  resolvedAt    DateTime?
+  /// UI language when it was sent ('en' | 'id') — a testimonial's original language.
+  lang          String?
+  /// Session mode of the strip being rated ('solo' | 'date' | 'group'). A hint for an
+  /// admin choosing a testimonial's feature tag, not a guarantee.
+  sessionMode   String?
+  /// The partner the author was linked to when they sent this, read by the server from
+  /// the link (never sent by the client). A couple testimonial shows this person, and
+  /// only while the author is still linked to them.
+  partnerUserId String?
+  partner       User?     @relation("FeedbackPartner", fields: [partnerUserId], references: [id], onDelete: SetNull)
+
+  /// The testimonial an admin built from this row, if any.
+  testimonial Testimonial?
+
+  /// Set only on feedback an admin typed in from somewhere else (an Instagram DM, a
+  /// WhatsApp message): where it came from, e.g. "Instagram DM, 14 Sep". Required for
+  /// those rows, so every admin-entered quote can be traced back. Null for in-app feedback.
+  sourceNote  String?
+  /// The admin who entered it. SetNull if that account goes; `sourceNote` still marks
+  /// the row as admin-entered.
+  enteredById String?
+  enteredBy   User?   @relation("FeedbackEnteredBy", fields: [enteredById], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+}
+
+/// A rating comment an admin has picked for the landing page's "What people say" section,
+/// with its English and Indonesian wording. Drafts (`publishedAt` null) never reach the
+/// public endpoint; at most `MAX_PUBLISHED_TESTIMONIALS` are published at once.
+///
+/// Name, place and avatar are deliberately not stored: they're read live from the author
+/// (and partner), so a profile change shows on the card.
+model Testimonial {
+  id            String    @id @default(cuid())
+  /// The person quoted. Cascade: deleting the account takes their words off the site.
+  userId        String
+  user          User      @relation("TestimonialAuthor", fields: [userId], references: [id], onDelete: Cascade)
+  /// The partner shown alongside, copied from `Feedback.partnerUserId` (who the author was
+  /// linked to when they wrote it). SetNull: a deleted partner account turns the card back
+  /// into a solo one. Shown only while the author is still linked to this person and
+  /// `showPartner` is on — see `coupleStatus` in `lib/testimonials.ts`.
+  partnerUserId String?
+  partner       User?     @relation("TestimonialPartner", fields: [partnerUserId], references: [id], onDelete: SetNull)
+  /// Admin switch for a partner who asked to be taken off the card.
+  showPartner   Boolean   @default(true)
+  /// Where it came from. SetNull: an admin tidying the inbox mustn't unpublish it.
+  feedbackId    String?   @unique
+  feedback      Feedback? @relation(fields: [feedbackId], references: [id], onDelete: SetNull)
+  /// The comment as written, kept so the record survives an inbox delete.
+  originalText  String
+  /// 'en' | 'id': which quote is the author's own words. Null when the feedback predates
+  /// language capture.
+  originalLang  String?
+  quoteEn       String
+  quoteId       String
+  /// Feature tag key (`TESTIMONIAL_FEATURES`). Labels live in the frontend locales.
+  feature       String
+  /// The author's stars, copied when featured and never edited.
+  rating        Int
+  /// Display order, ascending.
+  position      Int       @default(0)
+  /// Null = draft.
+  publishedAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([publishedAt, position])
+}
+
+/// A photo strip the user saved to their cart.
+///
+/// The image is the client-composed, **watermarked** strip — the free artifact shown
+/// in-app and used for the free Share. The clean (watermark-free) copy lives in
+/// `StripPrintImage` and is served only once `paid`.
+///
+/// **Where the pixels live.** A strip is a full-resolution PNG (~1–3 MB) and a user
+/// accumulates several, so unlike an avatar these do not belong in Postgres: every
+/// `<img>` render meant de-TOASTing megabytes, shipping them over the DB wire, and
+/// buffering them whole in the API's heap — and they rode along in every backup.
+/// They live in object storage (Cloudflare R2), addressed by `storageKey`.
+///
+/// The old inline `bytes` column is **gone** (migration `drop_strip_bytes`), so object
+/// storage is now required to save a strip — there is no in-database fallback. See
+/// `src/storage/objectStore.ts`; `R2_ENDPOINT` can point at MinIO for local work.
+model Strip {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Object-storage key in the public bucket. Nullable only because the column was
+  /// added to an existing table; every row written since the backfill has one.
+  storageKey   String?
+  /// Key of the small WebP preview used by the cart and admin grids, in the same
+  /// public bucket. Null when it hasn't been generated (legacy row) or couldn't be —
+  /// callers fall back to the full-size image, so this is never load-bearing.
+  thumbnailKey String?
+  mimeType     String
+  width        Int
+  height       Int
+  /// The photo session the strip came from: a room code (date) or "solo". Optional
+  /// so a strip is never orphaned if the origin is unknown.
+  sessionId    String?
+  /// "solo" | "date" — how the session was played. Free-form to avoid an enum
+  /// migration if modes change.
+  sessionMode  String?
+  /// True once a payment for this strip has settled (see Payment). Unlocks serving
+  /// the clean print image. Set by the Midtrans webhook, never the client.
+  paid         Boolean   @default(false)
+  paidAt       DateTime?
+  createdAt    DateTime  @default(now())
+  /// Idempotency key, minted by the client when the strip is composed (its `resultId`)
+  /// and resent unchanged on every retry of the same save.
+  ///
+  /// A strip upload is the app's largest request, and a client that gives up on it —
+  /// a timeout, a dropped connection, a closed tab — cannot cancel the write already
+  /// running here. Without this the retry that follows created a *second* row for the
+  /// same strip, so a save the user saw fail showed up twice in their cart.
+  ///
+  /// Nullable, and null rows are unconstrained: Postgres treats NULLs as distinct in a
+  /// unique index, so every legacy row and any client that sends no key still saves
+  /// normally — they simply get no replay protection.
+  clientKey    String?
+
+  printImage StripPrintImage?
+  payments   Payment[]
+
+  @@unique([userId, clientKey])
+  @@index([userId, createdAt])
+}
+
+/// The clean, watermark-free copy of a strip — the paid deliverable. Kept in a side
+/// table so listing strips never touches it, and so it can only be reached through
+/// the paid, auth-gated `GET /strips/:id/print`.
+///
+/// Stored in the **private** R2 bucket (never the public one): unlike the watermarked
+/// strip, this is what the user paid for, so it is always streamed through the paid
+/// gate rather than handed out as a CDN URL.
+model StripPrintImage {
+  stripId    String  @id
+  strip      Strip   @relation(fields: [stripId], references: [id], onDelete: Cascade)
+  /// Object-storage key in the private bucket. Nullable only for historical reasons —
+  /// see `Strip.storageKey`.
+  storageKey String?
+  mimeType   String
+  width      Int
+  height     Int
+}
+
+/// A checkout that unlocks the clean download/print for **one or more** strips, via
+/// Midtrans Snap. A single payment covers every strip the user selected in the cart.
+///
+/// `orderId` is the id we mint and hand to Midtrans (their `order_id`); it's the key
+/// the webhook looks a payment up by. `grossAmount` is set server-side (count ×
+/// `STRIP_PRINT_PRICE_IDR`) — never trusted from the client.
+model Payment {
+  id             String    @id @default(cuid())
+  /// Our Midtrans `order_id` (unique per attempt).
+  orderId        String    @unique
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// The strips this checkout unlocks (implicit m-n) — all flipped paid on settlement.
+  strips         Strip[]
+  grossAmount    Int
+  currency       String    @default("IDR")
+  /// pending | paid | failed | expired | cancelled
+  status         String    @default("pending")
+  /// Core API channel this order was charged on: gopay | shopeepay | qris.
+  paymentType    String?
+  /// Midtrans-hosted QR image (gopay, qris). Null for deeplink-only channels.
+  qrImageUrl     String?
+  /// Wallet deeplink (gopay, shopeepay) — opens the app on mobile.
+  deeplinkUrl    String?
+  /// When Midtrans stops accepting this QR/deeplink. Drives the modal countdown and
+  /// tells the client when to stop polling; the webhook still delivers `expire`.
+  expiresAt      DateTime?
+  /// Raw Midtrans `transaction_status` from the last notification, for audit.
+  midtransStatus String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  paidAt         DateTime?
+
+  @@index([userId])
+}
+
+/// **Legacy** storage for an uploaded profile picture, as bytes in Postgres.
+///
+/// Avatars now go to the same object storage as strips, and the key lives on
+/// `User.avatarKey`. A row here is either a picture uploaded before that change and
+/// not yet moved (run `npm run backfill:avatars`), or one written by a deployment
+/// with no R2 credentials at all — unlike a strip, an avatar is tens of kilobytes, so
+/// falling back to the database keeps a local checkout working rather than failing
+/// the upload. `GET /avatars/:userId` serves both shapes.
+///
+/// The browser crops and re-encodes to a small square before upload, so we never
+/// store the original file: no EXIF, so no GPS coordinates from someone's phone.
+///
+/// One row per user (the id *is* the user id), replaced wholesale on re-upload. A
+/// user never has both this and an `avatarKey`: whichever path writes clears the other.
+model AvatarImage {
+  userId    String   @id
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bytes     Bytes
+  mimeType  String
+  updatedAt DateTime @updatedAt
+}
+
+/// A hashed, rotatable refresh token. The raw token lives only in the client's
+/// httpOnly cookie; we store the SHA-256 hash so a DB leak can't mint sessions.
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+/// A short-lived, single-use code one user shares to link a partner account.
+model PartnerInvite {
+  code      String    @id
+  inviterId String
+  inviter   User      @relation("Inviter", fields: [inviterId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([inviterId])
+}
+
+/// A claim on an email address, pending proof.
+///
+/// **Why the address lives here and not on the user.** `User.email` is uniquely
+/// indexed. If signing up wrote it directly, anyone could register with
+/// `you@example.com` and permanently block the real owner from ever using it —
+/// without owning the mailbox, without confirming anything, and with no way for us to
+/// tell the difference. Because an unproven claim never touches that column, two
+/// people can claim one address and **the first to open their inbox wins**; the other
+/// gets `email_taken` at verification, from the unique index itself.
+///
+/// It also means changing an address is non-destructive: the verified one keeps
+/// working until the new one is proven, so a typo costs a retry rather than the
+/// account's only way back in.
+///
+/// Single-use and short-lived, hashed like `RefreshToken` — the raw token exists only
+/// in the emailed link.
+model EmailVerificationToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// The address being proven. Copied onto the user only when the link is opened.
+  email     String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+/// A single-use password-reset credential, hashed. The raw token exists only in the
+/// emailed link; a database leak yields hashes that can't be presented.
+///
+/// Deliberately shorter-lived than an email verification (minutes, not a day): this
+/// one can take over an account, and it sits in an inbox that may be open on a shared
+/// screen or synced to a device the user no longer has.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
