@@ -19,7 +19,8 @@ export interface Env {
   cookieSecure: boolean
   /**
    * Closed-beta switch: `true` refuses self-service signup, so the only accounts that
-   * exist are the ones an operator seeded (see `scripts/seedTesters.ts`).
+   * exist are the ones an operator seeded (the seeding script was retired 2026-09-19 —
+   * no further accounts are created until release; recover it from git history if needed).
    *
    * Covers **both** ways in: `POST /auth/register` answers 403 outright, and
    * `POST /auth/google` will still authenticate an identity it already knows but

@@ -162,7 +162,7 @@ src/
   storage/                 R2 object store + thumbnails
   index.ts                 entry: HTTP + periodic sweep + shutdown
 prisma/                    schema + migrations
-scripts/                   operator scripts (make-admin, seed:testers, send:*, backfill:*, check:*)
+scripts/                   operator scripts (make-admin, send:invites, backfill:*, check:*, purge:strips)
 ```
 
 Split from the old `momoto-be` on 2026-09-16: rooms, Socket.io and TURN moved to
