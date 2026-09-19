@@ -35,7 +35,6 @@ type Payload =
         partnerPassword?: string
       }
     }
-  | { type: 'booth_reminder'; data: { displayName: string; url: string } }
 
 /** How long to wait on the service before giving up. It only has to accept, not send. */
 const TIMEOUT_MS = 5_000
@@ -174,31 +173,3 @@ export function sendPasswordChanged(to: string, lang: Lang): Promise<boolean> {
   })
 }
 
-/**
- * Nudges someone who has an account but has never made a strip. Sent in waves by
- * `npm run send:reminders`, never from a request path.
- *
- * Carries no token and no password — deliberately. This is the one message that goes
- * to an address nobody has proven, so a copy forwarded to the wrong person has to be
- * worth nothing more than the link anyone can already type.
- */
-export function sendBoothReminder(to: string, displayName: string, lang: Lang): Promise<boolean> {
-  return notify(to, lang, boothReminderPayload(displayName))
-}
-
-/** The same message, rendered but not sent — `send:reminders --dry-run`. */
-export function previewBoothReminder(
-  to: string,
-  displayName: string,
-  lang: Lang,
-): Promise<{ subject: string; text: string; html: string } | null> {
-  return previewNotification(to, lang, boothReminderPayload(displayName))
-}
-
-/**
- * Shared so the dry run renders the same thing the real send mails — and so the
- * script never has to know that the booth lives at `/photobooth`.
- */
-function boothReminderPayload(displayName: string): Payload {
-  return { type: 'booth_reminder', data: { displayName, url: `${env.appBaseUrl}/photobooth` } }
-}

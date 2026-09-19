@@ -138,7 +138,7 @@ Accounts are persisted in **Postgres via Prisma** (`prisma/schema.prisma`): `Use
 2. Set env vars (at minimum `DATABASE_URL`, `JWT_SECRET`, `CORS_ORIGINS` = your real FE
    and admin origins).
 3. `npm run db:deploy && npm start` behind a TLS-terminating reverse proxy. Point the FE's
-   `VITE_API_URL` and the admin console's `VITE_API_URL` at the public URL.
+   `VITE_API_URL` and the operator portal's `VITE_API_URL` at the public URL.
 4. `GET /healthz` for liveness/readiness probes.
 
 **Scaling:** no room state lives here, so several instances can run behind a load
