@@ -1,0 +1,107 @@
+# Checks every pull request into staging or main, and every push to them.
+#
+# The push runs are what Railway's "Wait for CI" waits on: with it enabled, a push to a
+# branch Railway deploys from only deploys once this workflow passes on that commit.
+#
+# Errors are also written as `::error::` annotations, which show on the run summary to
+# anyone — the step logs need a GitHub sign-in.
+name: ci
+
+on:
+  pull_request:
+    branches: [staging, main]
+  push:
+    branches: [staging, main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # A new push to a PR supersedes the old run; a run Railway is waiting on is never cut short.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      # Throwaway database: migrations are applied to it from empty, then the server boots on it.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: momoto
+          POSTGRES_PASSWORD: momoto
+          POSTGRES_DB: momoto_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://momoto:momoto@localhost:5432/momoto_ci
+    steps:
+      - uses: actions/checkout@v5
+
+      # Not pinned by a repo file on purpose: Railway reads .nvmrc / .node-version too, so
+      # adding one here would also change the production runtime.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run format:check
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      - name: Migrations apply to an empty database
+        run: npx prisma migrate deploy
+
+      - name: Schema matches migrations
+        # Exit code 2 = schema.prisma has changes no migration creates. The SQL printed is
+        # what the missing migration would contain (`npm run db:migrate` generates it).
+        run: |
+          if ! npx prisma migrate diff --from-url "$DATABASE_URL" \
+              --to-schema-datamodel prisma/schema.prisma --exit-code --script; then
+            echo "::error title=Missing migration::schema.prisma differs from prisma/migrations — run npm run db:migrate and commit the migration"
+            exit 1
+          fi
+
+      - name: Boot test
+        # Starts the built server the way Railway does (node dist/index.js, NODE_ENV
+        # production), waits for /healthz, then sends SIGTERM and expects a clean exit.
+        env:
+          NODE_ENV: production
+          PORT: '9131'
+          JWT_SECRET: ci-only-not-a-real-secret-0123456789abcdef
+        run: |
+          node dist/index.js > boot.log 2>&1 &
+          pid=$!
+          for i in $(seq 1 30); do
+            curl -sf "localhost:$PORT/healthz" > /dev/null && break
+            if ! kill -0 "$pid" 2>/dev/null; then
+              cat boot.log
+              echo "::error title=Boot test::the server exited during startup (see the log)"
+              exit 1
+            fi
+            sleep 1
+          done
+          if ! curl -sf "localhost:$PORT/healthz"; then
+            cat boot.log
+            echo "::error title=Boot test::no /healthz response after 30 s"
+            kill -9 "$pid"
+            exit 1
+          fi
+          echo
+          kill -TERM "$pid"
+          ( sleep 20; kill -9 "$pid" 2>/dev/null ) &
+          if wait "$pid"; then code=0; else code=$?; fi
+          cat boot.log
+          if [ "$code" -ne 0 ]; then
+            echo "::error title=Boot test::exited with $code after SIGTERM — the shutdown handler failed or hung"
+            exit 1
+          fi
