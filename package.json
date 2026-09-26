@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Momoto Photobooth backend \u2014 Socket.io signaling + synchronization server.",
   "engines": {
-    "node": ">=20"
+    "node": "24.x"
   },
   "main": "dist/index.js",
   "scripts": {
