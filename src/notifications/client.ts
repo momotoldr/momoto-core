@@ -172,4 +172,3 @@ export function sendPasswordChanged(to: string, lang: Lang): Promise<boolean> {
     data: { resetUrl: `${env.appBaseUrl}/forgot-password` },
   })
 }
-
