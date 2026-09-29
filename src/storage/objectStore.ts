@@ -104,8 +104,7 @@ export function stripKey(
   const prefix = { watermarked: 'strips', print: 'prints', thumbnail: 'thumbs' }[kind]
   // The extension follows the actual bytes. Thumbnails are always WebP; the other two
   // are whatever the client encoded, so a key never claims a format the object isn't.
-  const extension =
-    kind === 'thumbnail' ? 'webp' : (IMAGE_EXTENSIONS[contentType ?? ''] ?? 'png')
+  const extension = kind === 'thumbnail' ? 'webp' : (IMAGE_EXTENSIONS[contentType ?? ''] ?? 'png')
   return `${prefix}/${crypto.randomUUID()}.${extension}`
 }
 

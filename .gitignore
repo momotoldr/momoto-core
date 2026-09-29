@@ -1,7 +1,11 @@
 node_modules/
 dist/
+# Every env file except the template. `.env.staging` / `.env.production` hold real
+# remote credentials — a DATABASE_URL, JWT_SECRET and R2 keys — so the deny-list has to
+# be by pattern, not by name: adding one more file must never be the thing that leaks.
 .env
-.env.local
+.env.*
+!.env.example
 *.log
 .DS_Store
 

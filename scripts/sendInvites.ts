@@ -134,13 +134,10 @@ function parseInvites(text: string, fallbackLang: string): Invite[] {
     // Both columns move together. Half a pair means the file was joined wrong, and the
     // result would be a credentials box in someone's inbox with no password in it —
     // worth stopping the wave for, the same as a missing password of their own.
-    const partnerUsername =
-      at.partnerUsername >= 0 ? (cells[at.partnerUsername] ?? '').trim() : ''
+    const partnerUsername = at.partnerUsername >= 0 ? (cells[at.partnerUsername] ?? '').trim() : ''
     const partnerPassword = at.partnerPassword >= 0 ? (cells[at.partnerPassword] ?? '') : ''
     if (Boolean(partnerUsername) !== Boolean(partnerPassword)) {
-      throw new Error(
-        `Line ${line}: needs both partnerUsername and partnerPassword, or neither.`,
-      )
+      throw new Error(`Line ${line}: needs both partnerUsername and partnerPassword, or neither.`)
     }
 
     invites.push({
