@@ -2,7 +2,9 @@ import { Prisma } from '@prisma/client'
 import { Router } from 'express'
 
 import { hashPassword } from '../../auth/passwords.js'
+import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
+import { clientIp } from '../../lib/clientIp.js'
 import { isValidEmail } from '../../lib/email.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
@@ -46,7 +48,7 @@ export function sweepAdminLimits(now: number = Date.now()): number {
 
 // Every admin route: authenticated → is-admin → rate-limited.
 adminRouter.use(requireAuth, requireAdmin, (req, res, next) => {
-  if (!adminLimiter.allow(req.ip ?? 'unknown')) {
+  if (!adminLimiter.allow(clientIp(req, env.clientIpHeader) ?? 'unknown')) {
     res.status(429).json({ error: 'too_many_requests' })
     return
   }

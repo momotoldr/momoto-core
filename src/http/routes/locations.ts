@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto'
 
 import { Router } from 'express'
 
+import { env } from '../../config/env.js'
+import { clientIp } from '../../lib/clientIp.js'
 import { COUNTRY_CODES, provinces, regionsInProvince } from '../../lib/locations.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
 
@@ -59,7 +61,7 @@ export function sweepLocationsLimits(now: number = Date.now()): number {
 // Deliberately not `GET /locations`: that path once served a different shape with a
 // day-long cache, and a new path is the only thing that reaches browsers still holding it.
 locationsRouter.get('/provinces', (req, res) => {
-  if (!locationsLimiter.allow(req.ip ?? 'unknown')) {
+  if (!locationsLimiter.allow(clientIp(req, env.clientIpHeader) ?? 'unknown')) {
     res.status(429).json({ error: 'too_many_requests' })
     return
   }
@@ -68,7 +70,7 @@ locationsRouter.get('/provinces', (req, res) => {
 
 // ── GET /locations/provinces/:code/regions ─── one province's cities and regencies ──
 locationsRouter.get('/provinces/:code/regions', (req, res) => {
-  if (!locationsLimiter.allow(req.ip ?? 'unknown')) {
+  if (!locationsLimiter.allow(clientIp(req, env.clientIpHeader) ?? 'unknown')) {
     res.status(429).json({ error: 'too_many_requests' })
     return
   }
