@@ -24,7 +24,9 @@ import {
 } from '../../auth/tokens.js'
 import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
+import { clientIp } from '../../lib/clientIp.js'
 import { isValidEmail, normalizeEmail } from '../../lib/email.js'
+import { ipPrefix } from '../../lib/ipPrefix.js'
 import { parseLocation } from '../../lib/locations.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
@@ -170,7 +172,8 @@ async function establishSession(res: Response, userId: string): Promise<{ access
 }
 
 function limited(res: Response, event: string, ip: string): boolean {
-  logger.warn(event, { ip })
+  // The network, not the address: enough to spot one source hammering an endpoint.
+  logger.warn(event, { ipPrefix: ipPrefix(ip) })
   res.status(429).json({ error: 'too_many_requests' })
   return true
 }
@@ -179,7 +182,7 @@ function limited(res: Response, event: string, ip: string): boolean {
 authRouter.post(
   '/register',
   asyncRoute(async (req, res) => {
-    const ip = req.ip ?? 'unknown'
+    const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
     if (!authLimiter.allow(ip)) return void limited(res, 'auth.register.ratelimited', ip)
 
     // Closed beta: accounts are seeded by an operator, never self-served. Hiding the
@@ -267,7 +270,7 @@ authRouter.post(
 authRouter.post(
   '/login',
   asyncRoute(async (req, res) => {
-    const ip = req.ip ?? 'unknown'
+    const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
     if (!authLimiter.allow(ip)) return void limited(res, 'auth.login.ratelimited', ip)
 
     const username = String(req.body?.username ?? '')
@@ -308,7 +311,7 @@ authRouter.post(
 authRouter.post(
   '/google',
   asyncRoute(async (req, res) => {
-    const ip = req.ip ?? 'unknown'
+    const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
     if (!authLimiter.allow(ip)) return void limited(res, 'auth.google.ratelimited', ip)
 
     const idToken = String(req.body?.idToken ?? '')
@@ -381,7 +384,7 @@ authRouter.post(
 authRouter.post(
   '/refresh',
   asyncRoute(async (req, res) => {
-    const ip = req.ip ?? 'unknown'
+    const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
     if (!refreshLimiter.allow(ip)) return void limited(res, 'auth.refresh.ratelimited', ip)
 
     const raw = req.cookies?.[REFRESH_COOKIE]
@@ -504,7 +507,7 @@ authRouter.post(
 authRouter.post(
   '/verify-email',
   asyncRoute(async (req, res) => {
-    const ip = req.ip ?? 'unknown'
+    const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
     if (!resetTokenLimiter.allow(ip)) return void limited(res, 'auth.verify_email.ratelimited', ip)
 
     const token = String(req.body?.token ?? '')
@@ -614,7 +617,7 @@ authRouter.post(
 authRouter.post(
   '/forgot-password',
   asyncRoute(async (req, res) => {
-    const ip = req.ip ?? 'unknown'
+    const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
     if (!forgotIpLimiter.allow(ip)) return void limited(res, 'auth.forgot.ratelimited', ip)
 
     const identifier = String(req.body?.identifier ?? '')
@@ -649,7 +652,7 @@ authRouter.post(
 authRouter.get(
   '/reset-password',
   asyncRoute(async (req, res) => {
-    const ip = req.ip ?? 'unknown'
+    const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
     if (!resetTokenLimiter.allow(ip)) return void limited(res, 'auth.reset.ratelimited', ip)
 
     const token = typeof req.query.token === 'string' ? req.query.token : ''
@@ -661,7 +664,7 @@ authRouter.get(
 authRouter.post(
   '/reset-password',
   asyncRoute(async (req, res) => {
-    const ip = req.ip ?? 'unknown'
+    const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
     if (!resetTokenLimiter.allow(ip)) return void limited(res, 'auth.reset.ratelimited', ip)
 
     const token = String(req.body?.token ?? '')

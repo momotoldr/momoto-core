@@ -2,7 +2,9 @@ import type { Request } from 'express'
 import { Router } from 'express'
 
 import { verifyAccessToken } from '../../auth/tokens.js'
+import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
+import { clientIp } from '../../lib/clientIp.js'
 import { isValidEmail } from '../../lib/email.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
@@ -55,7 +57,7 @@ function oneOf(value: unknown, allowed: Set<string>): string | null {
 feedbackRouter.post(
   '/',
   asyncRoute(async (req, res) => {
-    if (!feedbackLimiter.allow(req.ip ?? 'unknown')) {
+    if (!feedbackLimiter.allow(clientIp(req, env.clientIpHeader) ?? 'unknown')) {
       res.status(429).json({ error: 'too_many_requests' })
       return
     }
