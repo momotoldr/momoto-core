@@ -1,6 +1,8 @@
 import { Router } from 'express'
 
+import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
+import { clientIp } from '../../lib/clientIp.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
 import { asyncRoute } from '../asyncRoute.js'
@@ -103,7 +105,7 @@ export function sweepStatsLimits(now: number = Date.now()): number {
 statsRouter.get(
   '/',
   asyncRoute(async (req, res) => {
-    if (!statsLimiter.allow(req.ip ?? 'unknown')) {
+    if (!statsLimiter.allow(clientIp(req, env.clientIpHeader) ?? 'unknown')) {
       res.status(429).json({ error: 'too_many_requests' })
       return
     }
