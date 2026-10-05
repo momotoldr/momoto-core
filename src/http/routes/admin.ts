@@ -713,6 +713,7 @@ const feedbackRowSelect = {
   message: true,
   email: true,
   context: true,
+  analyticsSessionId: true,
   userAgent: true,
   createdAt: true,
   resolvedAt: true,
