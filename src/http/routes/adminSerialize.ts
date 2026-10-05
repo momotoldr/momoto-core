@@ -124,6 +124,7 @@ export interface AdminFeedbackInput {
   message: string
   email: string | null
   context: string | null
+  analyticsSessionId: string | null
   userAgent: string | null
   createdAt: Date
   resolvedAt: Date | null
@@ -148,6 +149,7 @@ export function serializeAdminFeedback(f: AdminFeedbackInput) {
     message: f.message,
     email: f.email,
     context: f.context,
+    analyticsSessionId: f.analyticsSessionId,
     userAgent: f.userAgent,
     user: f.user ? serializeUserSummary(f.user) : null,
     createdAt: f.createdAt.toISOString(),
