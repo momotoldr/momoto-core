@@ -119,6 +119,7 @@ export interface AdminFeedbackInput {
   id: string
   ticketNumber: number
   category: string
+  topic: string | null
   rating: number | null
   message: string
   email: string | null
@@ -142,6 +143,7 @@ export function serializeAdminFeedback(f: AdminFeedbackInput) {
     id: f.id,
     ticketNumber: f.ticketNumber,
     category: f.category,
+    topic: f.topic,
     rating: f.rating,
     message: f.message,
     email: f.email,

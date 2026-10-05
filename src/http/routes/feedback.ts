@@ -25,6 +25,8 @@ export function sweepFeedbackLimits(now: number = Date.now()): number {
 }
 
 const CATEGORIES = new Set(['feedback', 'support'])
+/** What a support request is about — picked in the support dialog before writing. */
+const SUPPORT_TOPICS = new Set(['session', 'strip', 'payment', 'account', 'other'])
 const LANGS = new Set(['en', 'id'])
 const SESSION_MODES = new Set(['solo', 'date', 'group'])
 const MAX_MESSAGE = 4000
@@ -68,6 +70,10 @@ feedbackRouter.post(
       typeof body.category === 'string' && CATEGORIES.has(body.category)
         ? body.category
         : 'feedback'
+
+    // A triage hint, so an unknown value is dropped rather than rejected — an older
+    // client (or a topic added to the dialog before the server) still gets through.
+    const topic = category === 'support' ? oneOf(body.topic, SUPPORT_TOPICS) : null
 
     let rating: number | null = null
     if (
@@ -116,6 +122,7 @@ feedbackRouter.post(
       data: {
         userId,
         category,
+        topic,
         rating,
         message,
         email,
@@ -128,6 +135,7 @@ feedbackRouter.post(
     })
     logger.info('feedback.received', {
       category,
+      topic: topic ?? undefined,
       rating: rating ?? undefined,
       hasEmail: Boolean(email),
       userId: userId ?? undefined,
