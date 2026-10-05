@@ -664,6 +664,7 @@ adminRouter.get(
     const { page, limit, skip, take } = parsePagination(query)
     const category =
       typeof query.category === 'string' && query.category ? query.category : undefined
+    const topic = typeof query.topic === 'string' && query.topic ? query.topic : undefined
     const ratingInt = toInt(query.rating, 0)
     const rating = ratingInt >= 1 && ratingInt <= 5 ? ratingInt : undefined
     // Ticket search: accept "5", "SUP-0005", "sup 5" — match on the digits only.
@@ -680,6 +681,7 @@ adminRouter.get(
     const eligible = query.eligible === '1' || query.eligible === 'true'
     const where = {
       ...(category ? { category } : {}),
+      ...(topic ? { topic } : {}),
       ...(rating ? { rating } : {}),
       ...(ticketNumber ? { ticketNumber } : {}),
       ...statusWhere,
@@ -706,6 +708,7 @@ const feedbackRowSelect = {
   id: true,
   ticketNumber: true,
   category: true,
+  topic: true,
   rating: true,
   message: true,
   email: true,

@@ -118,6 +118,10 @@ model Feedback {
   userId        String?
   user          User?     @relation("FeedbackAuthor", fields: [userId], references: [id], onDelete: SetNull)
   category      String
+  /// What a support request is about ('session' | 'strip' | 'payment' | 'account' |
+  /// 'other'), picked before the message is written. Null for ratings, admin-entered
+  /// feedback, and support requests sent before topics existed.
+  topic         String?
   /// Optional 1–5 satisfaction rating.
   rating        Int?
   /// Empty string when the row is a rating on its own (the star rating beside a
