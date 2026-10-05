@@ -32,6 +32,8 @@ const SESSION_MODES = new Set(['solo', 'date', 'group'])
 const MAX_MESSAGE = 4000
 const MAX_CONTEXT = 200
 const MAX_USER_AGENT = 400
+/** The tracker's visit id is a UUID; anything else isn't one of its ids. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 const BEARER = 'Bearer '
 
@@ -103,6 +105,13 @@ feedbackRouter.post(
     // Context for a testimonial built from this row later: the language it was written
     // in, and which kind of session the rated strip came from. Anything unexpected is
     // dropped rather than rejected — these are hints, not part of the message.
+    // The sender's analytics visit, so their event timeline can be looked up from the
+    // message. A hint like the rest: a malformed one is dropped, not rejected.
+    const analyticsSessionId =
+      typeof body.sessionId === 'string' && UUID_RE.test(body.sessionId)
+        ? body.sessionId.toLowerCase()
+        : null
+
     const lang = oneOf(body.lang, LANGS)
     const sessionMode = oneOf(body.sessionMode, SESSION_MODES)
 
@@ -127,6 +136,7 @@ feedbackRouter.post(
         message,
         email,
         context,
+        analyticsSessionId,
         userAgent,
         lang,
         sessionMode,
