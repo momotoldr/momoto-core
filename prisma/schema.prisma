@@ -110,38 +110,45 @@ model User {
 /// kept for triage. `category` is free-form ("feedback" | "support") to avoid an
 /// enum migration if the set changes.
 model Feedback {
-  id            String    @id @default(cuid())
+  id                 String    @id @default(cuid())
   /// Short, human-referenceable ticket number (auto-incrementing). Assigned to every
   /// row, but only surfaced in the admin console for support requests, where an
   /// operator needs something short to quote back to the user.
-  ticketNumber  Int       @unique @default(autoincrement())
-  userId        String?
-  user          User?     @relation("FeedbackAuthor", fields: [userId], references: [id], onDelete: SetNull)
-  category      String
+  ticketNumber       Int       @unique @default(autoincrement())
+  userId             String?
+  user               User?     @relation("FeedbackAuthor", fields: [userId], references: [id], onDelete: SetNull)
+  category           String
+  /// What a support request is about ('session' | 'strip' | 'payment' | 'account' |
+  /// 'other'), picked before the message is written. Null for ratings, admin-entered
+  /// feedback, and support requests sent before topics existed.
+  topic              String?
   /// Optional 1–5 satisfaction rating.
-  rating        Int?
+  rating             Int?
   /// Empty string when the row is a rating on its own (the star rating beside a
   /// finished strip is one tap, with no comment attached).
-  message       String
+  message            String
   /// Optional reply-to address (prefilled from the account when signed in).
-  email         String?
+  email              String?
   /// Where it was sent from (a page path) — a client-supplied triage hint.
-  context       String?
-  userAgent     String?
-  createdAt     DateTime  @default(now())
+  context            String?
+  /// The sender's analytics visit (momoto-tracker `sessionId`, a UUID): the key to their
+  /// event timeline in momoto-analytics. Null when tracking was off for that visit.
+  analyticsSessionId String?
+  userAgent          String?
+  createdAt          DateTime  @default(now())
   /// When an admin marked this message handled (null = still open). Set from the
   /// admin console; the acting admin is recorded in the server log, not here.
-  resolvedAt    DateTime?
+  resolvedAt         DateTime?
   /// UI language when it was sent ('en' | 'id') — a testimonial's original language.
-  lang          String?
+  lang               String?
   /// Session mode of the strip being rated ('solo' | 'date' | 'group'). A hint for an
   /// admin choosing a testimonial's feature tag, not a guarantee.
-  sessionMode   String?
+  sessionMode        String?
   /// The partner the author was linked to when they sent this, read by the server from
   /// the link (never sent by the client). A couple testimonial shows this person, and
   /// only while the author is still linked to them.
-  partnerUserId String?
-  partner       User?     @relation("FeedbackPartner", fields: [partnerUserId], references: [id], onDelete: SetNull)
+  partnerUserId      String?
+  partner            User?     @relation("FeedbackPartner", fields: [partnerUserId], references: [id], onDelete: SetNull)
 
   /// The testimonial an admin built from this row, if any.
   testimonial Testimonial?
