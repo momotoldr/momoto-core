@@ -42,6 +42,7 @@ import {
 import { asyncRoute } from '../asyncRoute.js'
 import { readImageSize, sniffImageType } from '../imageType.js'
 import { requireAuth } from '../middleware/requireAuth.js'
+import { deleteStripObjects } from './strips.js'
 
 export const authRouter = Router()
 
@@ -897,9 +898,10 @@ authRouter.delete(
 // Self-service account deletion. For an account that has a password, we re-verify
 // it here: an access token alone (which could be lingering on a shared device)
 // shouldn't be enough to erase an account. Google-only accounts have no password to
-// check — the valid session is the proof. The delete cascades the user's strips,
-// avatar, refresh tokens and partner invites, unlinks any partner, and detaches
-// feedback (kept for triage); their payment records are removed with the account.
+// check — the valid session is the proof. The delete cascades the user's strip rows,
+// refresh tokens and partner invites, unlinks any partner, and detaches feedback (kept
+// for triage); their payment records are removed with the account. The strips' images
+// and the avatar live in object storage, which doesn't cascade — they're deleted after.
 authRouter.delete(
   '/me',
   requireAuth,
@@ -925,9 +927,24 @@ authRouter.delete(
       }
     }
 
+    // Strip rows cascade with the account, but the images they point at don't — collect
+    // the keys before the rows are gone, as `DELETE /admin/users/:id` does. Without this,
+    // every self-deleted account left its strips in both buckets with no row naming them.
+    const strips = await prisma.strip.findMany({
+      where: { userId },
+      select: {
+        storageKey: true,
+        thumbnailKey: true,
+        printImage: { select: { storageKey: true } },
+      },
+    })
+
     await prisma.user.delete({ where: { id: userId } })
     // Their testimonials cascaded away (or dropped them as a partner) — refresh the landing cache.
     markTestimonialsChanged()
+    // Best-effort, after the row is gone: a failure is logged, and the account is deleted
+    // either way.
+    await deleteStripObjects(strips)
     if (user.avatarKey) await deleteImages('avatar', [user.avatarKey])
     res.clearCookie(REFRESH_COOKIE, refreshCookieOptions())
     logger.info('auth.account.deleted', { userId })
