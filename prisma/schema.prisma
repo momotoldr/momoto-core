@@ -260,6 +260,11 @@ model Strip {
   /// unique index, so every legacy row and any client that sends no key still saves
   /// normally — they simply get no replay protection.
   clientKey    String?
+  /// When the owner removed this unlocked strip from their gallery. Set means the strip's
+  /// files are gone and it no longer counts toward the gallery limit — but the row stays,
+  /// so the payments that bought it still name it (`Payment.strips` is a join; deleting
+  /// the strip would drop that link). Only ever set on a paid strip.
+  removedAt    DateTime?
 
   printImage StripPrintImage?
   payments   Payment[]
