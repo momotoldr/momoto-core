@@ -474,6 +474,7 @@ adminRouter.get(
           sessionMode: true,
           paid: true,
           paidAt: true,
+          removedAt: true,
           createdAt: true,
           user: { select: userSummarySelect },
         },
@@ -1099,9 +1100,12 @@ adminRouter.get(
     const paid = query.paid === 'true' ? true : query.paid === 'false' ? false : undefined
     const mode =
       typeof query.sessionMode === 'string' && query.sessionMode ? query.sessionMode : undefined
+    // `removed=true` → only strips taken out of a gallery; `false` → only live ones.
+    const removed = query.removed === 'true' ? true : query.removed === 'false' ? false : undefined
     const where = {
       ...(paid !== undefined ? { paid } : {}),
       ...(mode ? { sessionMode: mode } : {}),
+      ...(removed !== undefined ? { removedAt: removed ? { not: null } : null } : {}),
     }
 
     const [items, total] = await Promise.all([
@@ -1120,6 +1124,7 @@ adminRouter.get(
           sessionMode: true,
           paid: true,
           paidAt: true,
+          removedAt: true,
           createdAt: true,
           user: { select: userSummarySelect },
         },
