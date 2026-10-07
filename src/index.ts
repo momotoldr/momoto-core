@@ -19,7 +19,7 @@ import { sweepPartnerInvites, sweepPartnerLimits } from './http/routes/partner.j
 import { sweepPaymentLimits } from './http/routes/payments.js'
 import { sweepStatsLimits } from './http/routes/stats.js'
 import { sweepTestimonialsLimits } from './http/routes/testimonials.js'
-import { sweepStripLimits, sweepUnlockLimits } from './http/routes/strips.js'
+import { sweepRemoveLimits, sweepStripLimits, sweepUnlockLimits } from './http/routes/strips.js'
 import { logger } from './lib/logger.js'
 
 // Rooms, Socket.io and TURN credentials are served by momoto-realtime, not here.
@@ -36,6 +36,7 @@ const sweeper = setInterval(() => {
     sweepTestimonialsLimits()
     sweepStripLimits()
     sweepUnlockLimits()
+    sweepRemoveLimits()
     sweepPaymentLimits()
     sweepFeedbackLimits()
     sweepLocationsLimits()
