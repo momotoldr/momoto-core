@@ -259,12 +259,23 @@ export interface AdminStripInput {
   sessionMode: string | null
   paid: boolean
   paidAt: Date | null
+  removedAt: Date | null
   createdAt: Date
   user: UserSummaryInput
 }
 
 /** A strip row (metadata only — never bytes) for the admin strips table. */
 export function serializeAdminStrip(s: AdminStripInput) {
+  // Removed from the owner's gallery: the row is kept for the payment record, but its
+  // files are deleted, so there is no image to point at. Null rather than the
+  // `/strips/:id` fallback below, which would only 404.
+  if (s.removedAt) {
+    return {
+      ...stripMeta(s),
+      url: null,
+      thumbnailUrl: null,
+    }
+  }
   const cdn = s.storageKey ? publicUrl('public', s.storageKey) : null
   // The CDN URL when the image is in storage — this table renders a page of images
   // at once, so keeping them off the API is where it matters most. Otherwise
@@ -272,11 +283,18 @@ export function serializeAdminStrip(s: AdminStripInput) {
   const url = cdn ?? `/strips/${s.id}`
   const thumbCdn = s.thumbnailKey ? publicUrl('public', s.thumbnailKey) : null
   return {
-    id: s.id,
     url,
     // What the table actually renders, in an 80px-tall row. Falls back to the full
     // image so the column is never empty.
     thumbnailUrl: thumbCdn ?? (s.thumbnailKey ? `/strips/${s.id}/thumb` : url),
+    ...stripMeta(s),
+  }
+}
+
+/** Everything an admin strip row carries besides its image URLs. */
+function stripMeta(s: AdminStripInput) {
+  return {
+    id: s.id,
     width: s.width,
     height: s.height,
     sessionId: s.sessionId,
@@ -284,6 +302,7 @@ export function serializeAdminStrip(s: AdminStripInput) {
     paid: s.paid,
     user: serializeUserSummary(s.user),
     paidAt: s.paidAt ? s.paidAt.toISOString() : null,
+    removedAt: s.removedAt ? s.removedAt.toISOString() : null,
     createdAt: s.createdAt.toISOString(),
   }
 }

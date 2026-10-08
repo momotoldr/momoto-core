@@ -425,7 +425,10 @@ function readClientKey(query: Record<string, unknown>): string | null {
  */
 async function findReplayedStrip(userId: string, clientKey: string | null) {
   if (!clientKey) return null
-  return prisma.strip.findFirst({ where: { userId, clientKey }, select: stripSummarySelect })
+  return prisma.strip.findFirst({
+    where: { userId, clientKey },
+    select: { ...stripSummarySelect, removedAt: true },
+  })
 }
 
 /** True for a P2002 raised by the `(userId, clientKey)` idempotency index. */
@@ -544,6 +547,14 @@ stripsRouter.post(
     // be refused as `cart_full` by the very strip it is replaying, and re-uploading
     // bytes we already stored would only orphan them.
     const replayed = await findReplayedStrip(userId, clientKey)
+    // A retry so late that the strip it replays was unlocked and then removed from the
+    // gallery in between. Effectively unreachable (retries land within seconds), but
+    // answering with a strip whose images are gone would put a broken tile in the cart.
+    if (replayed?.removedAt) {
+      logger.info('strips.saveReplayedRemoved', { userId, stripId: replayed.id })
+      res.status(409).json({ error: 'strip_removed' })
+      return
+    }
     if (replayed) {
       logger.info('strips.saveReplayed', { userId, stripId: replayed.id })
       // 200, not 201: nothing was created. The client treats both as success.
@@ -662,7 +673,9 @@ export async function galleryRoomFor(
   userId: string,
   adding: number,
 ): Promise<{ ok: true } | { ok: false; used: number; limit: number }> {
-  const used = await prisma.strip.count({ where: { userId, paid: true } })
+  // A removed strip was paid for but no longer holds a slot — freeing one is the point
+  // of removing it.
+  const used = await prisma.strip.count({ where: { userId, paid: true, removedAt: null } })
   const limit = env.galleryMaxItems
   return used + adding > limit ? { ok: false, used, limit } : { ok: true }
 }
@@ -832,6 +845,98 @@ stripsRouter.post(
   }),
 )
 
+/** Removing deletes objects in two buckets per call — keep the rate modest. */
+const removeLimiter = new RateLimiter(30, 10 * 60_000)
+
+/** Reclaim expired remove rate windows (wired into the periodic sweep). */
+export function sweepRemoveLimits(now: number = Date.now()): number {
+  return removeLimiter.sweep(now)
+}
+
+/** The user's live strips' quota, for a response that has just changed it. */
+async function currentQuota(userId: string) {
+  const strips = await prisma.strip.findMany({
+    where: { userId, removedAt: null },
+    select: { paid: true },
+  })
+  return quotaFor(strips)
+}
+
+// ── POST /strips/:id/remove ─── take an unlocked strip out of the gallery ────
+/**
+ * The gallery's Remove: a **soft** delete of an unlocked strip.
+ *
+ * The row stays and the files go. `Payment.strips` is a join, so hard-deleting the row
+ * would leave the payment that bought it unable to say what it was for — the record a
+ * refund or a support question needs. The files, on the other hand, are what the
+ * gallery limit exists to bound, and nothing about a payment needs them: all three
+ * objects (watermarked, thumbnail, clean copy) are deleted, so nothing of the photo is
+ * kept once its owner has asked for it gone.
+ *
+ * Cart strips aren't removed here — nothing was paid for them, and `DELETE` stays
+ * the right tool. Removing twice is a no-op success, so a double tap or a retry after a
+ * dropped response never shows an error.
+ */
+stripsRouter.post(
+  '/:id/remove',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const userId = req.userId as string
+    if (!removeLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
+
+    // Read the keys before they are nulled: once the row stops naming the objects,
+    // nothing else ever will.
+    const strip = await prisma.strip.findFirst({
+      where: { id: req.params.id, userId },
+      select: {
+        id: true,
+        paid: true,
+        removedAt: true,
+        storageKey: true,
+        thumbnailKey: true,
+        printImage: { select: { storageKey: true } },
+      },
+    })
+    if (!strip) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+    if (!strip.paid) {
+      res.status(409).json({ error: 'strip_not_paid' })
+      return
+    }
+    if (strip.removedAt) {
+      res.json({ quota: await currentQuota(userId) })
+      return
+    }
+
+    // Guarded on `removedAt: null` so two racing removes can't both delete objects: the
+    // loser updates nothing and answers like the already-removed case above.
+    const [{ count }] = await prisma.$transaction([
+      prisma.strip.updateMany({
+        where: { id: strip.id, userId, paid: true, removedAt: null },
+        data: { removedAt: new Date(), storageKey: null, thumbnailKey: null },
+      }),
+      prisma.stripPrintImage.deleteMany({ where: { stripId: strip.id } }),
+    ])
+    if (count > 0) {
+      // Best-effort, after the row is settled — same posture as `DELETE`. A failure is
+      // logged as `storage.delete.failed` and left for `purge:strips --orphans-only`.
+      await deleteStripObjects([strip])
+      const paidOrders = await prisma.payment.count({
+        where: { status: 'paid', strips: { some: { id: strip.id } } },
+      })
+      // `bought` separates removals of strips someone paid for from free unlocks.
+      logger.info('strips.removed', { userId, stripId: strip.id, bought: paidOrders > 0 })
+    }
+
+    res.json({ quota: await currentQuota(userId) })
+  }),
+)
+
 // ── GET /strips ─── list the current user's strips (newest first) ────────────
 stripsRouter.get(
   '/',
@@ -839,7 +944,10 @@ stripsRouter.get(
   asyncRoute(async (req, res) => {
     const userId = req.userId as string
     const strips = await prisma.strip.findMany({
-      where: { userId },
+      // Removed strips have no images left to show, and the client never needs them:
+      // the purchase history still names them through the payment, and draws a
+      // placeholder for an id the cart doesn't hold.
+      where: { userId, removedAt: null },
       orderBy: { createdAt: 'desc' },
       // Never load the bytes for a listing — the metadata + image URL is all the cart
       // needs, and the bytes are large.
@@ -1101,11 +1209,19 @@ stripsRouter.delete(
       where: { id: req.params.id, userId },
       select: {
         id: true,
+        paid: true,
         storageKey: true,
         thumbnailKey: true,
         printImage: { select: { storageKey: true } },
       },
     })
+    // An unlocked strip is never hard-deleted: dropping the row drops its join to the
+    // payment that bought it, and the order would no longer say what it was for. The
+    // gallery removes one with `POST /strips/:id/remove`, which keeps the row.
+    if (strip?.paid) {
+      res.status(409).json({ error: 'strip_paid' })
+      return
+    }
     // Refuse while a still-payable payment covers this strip. Deleting it would drop the
     // join row, and the webhook that settles minutes later would then flip *nothing* —
     // the user charged for a strip that no longer exists. The client hides the control,
