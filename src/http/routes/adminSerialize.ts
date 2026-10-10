@@ -56,7 +56,7 @@ export interface AdminUserRowInput {
   cityName: string | null
   createdAt: Date
   updatedAt: Date
-  _count: { strips: number; payments: number; feedbacks: number }
+  _count: { strips: number; payments: number; feedbacks: number; supportTickets: number }
 }
 
 /** A user row for the admin users table. */
@@ -79,6 +79,7 @@ export function serializeAdminUser(u: AdminUserRowInput) {
       strips: u._count.strips,
       payments: u._count.payments,
       feedbacks: u._count.feedbacks,
+      supportTickets: u._count.supportTickets,
     },
   }
 }
@@ -94,7 +95,8 @@ export interface AdminPaymentInput {
   createdAt: Date
   updatedAt: Date
   paidAt: Date | null
-  user: UserSummaryInput
+  /** Null once the payer deleted their account (the payment is kept). */
+  user: UserSummaryInput | null
   _count: { strips: number }
 }
 
@@ -108,7 +110,7 @@ export function serializeAdminPayment(p: AdminPaymentInput) {
     status: p.status,
     midtransStatus: p.midtransStatus,
     stripCount: p._count.strips,
-    user: serializeUserSummary(p.user),
+    user: p.user ? serializeUserSummary(p.user) : null,
     createdAt: p.createdAt.toISOString(),
     paidAt: p.paidAt ? p.paidAt.toISOString() : null,
   }
@@ -117,9 +119,6 @@ export function serializeAdminPayment(p: AdminPaymentInput) {
 // ── Feedback ────────────────────────────────────────────────────────────────────
 export interface AdminFeedbackInput {
   id: string
-  ticketNumber: number
-  category: string
-  topic: string | null
   rating: number | null
   message: string
   email: string | null
@@ -127,7 +126,6 @@ export interface AdminFeedbackInput {
   analyticsSessionId: string | null
   userAgent: string | null
   createdAt: Date
-  resolvedAt: Date | null
   lang: string | null
   sessionMode: string | null
   partnerUserId: string | null
@@ -138,13 +136,10 @@ export interface AdminFeedbackInput {
   enteredBy: UserSummaryInput | null
 }
 
-/** A feedback/support row for the admin feedback inbox. */
+/** A rating/comment row for the admin feedback inbox. */
 export function serializeAdminFeedback(f: AdminFeedbackInput) {
   return {
     id: f.id,
-    ticketNumber: f.ticketNumber,
-    category: f.category,
-    topic: f.topic,
     rating: f.rating,
     message: f.message,
     email: f.email,
@@ -153,7 +148,6 @@ export function serializeAdminFeedback(f: AdminFeedbackInput) {
     userAgent: f.userAgent,
     user: f.user ? serializeUserSummary(f.user) : null,
     createdAt: f.createdAt.toISOString(),
-    resolvedAt: f.resolvedAt ? f.resolvedAt.toISOString() : null,
     lang: f.lang,
     sessionMode: f.sessionMode,
     testimonialId: f.testimonial?.id ?? null,
@@ -162,7 +156,6 @@ export function serializeAdminFeedback(f: AdminFeedbackInput) {
     sourceNote: f.sourceNote,
     enteredBy: f.enteredBy ? serializeUserSummary(f.enteredBy) : null,
     eligible: isEligibleFeedback({
-      category: f.category,
       hasAuthor: f.user !== null,
       message: f.message,
       rating: f.rating,
@@ -175,6 +168,40 @@ export function serializeAdminFeedback(f: AdminFeedbackInput) {
       f.partner && f.user?.partnerId === f.partnerUserId
         ? serializeTestimonialPerson(f.partner)
         : null,
+  }
+}
+
+// ── Support tickets ─────────────────────────────────────────────────────────────
+export interface AdminSupportTicketInput {
+  id: string
+  ticketNumber: number
+  topic: string | null
+  message: string
+  email: string | null
+  context: string | null
+  analyticsSessionId: string | null
+  userAgent: string | null
+  lang: string | null
+  createdAt: Date
+  resolvedAt: Date | null
+  user: UserSummaryInput | null
+}
+
+/** A help request for the admin support inbox. */
+export function serializeAdminSupportTicket(t: AdminSupportTicketInput) {
+  return {
+    id: t.id,
+    ticketNumber: t.ticketNumber,
+    topic: t.topic,
+    message: t.message,
+    email: t.email,
+    context: t.context,
+    analyticsSessionId: t.analyticsSessionId,
+    userAgent: t.userAgent,
+    lang: t.lang,
+    user: t.user ? serializeUserSummary(t.user) : null,
+    createdAt: t.createdAt.toISOString(),
+    resolvedAt: t.resolvedAt ? t.resolvedAt.toISOString() : null,
   }
 }
 
@@ -211,7 +238,6 @@ export interface AdminTestimonialInput {
   quoteId: string
   feature: string
   rating: number
-  position: number
   publishedAt: Date | null
   showPartner: boolean
   partnerUserId: string | null
@@ -232,7 +258,6 @@ export function serializeAdminTestimonial(t: AdminTestimonialInput) {
     quoteId: t.quoteId,
     feature: t.feature,
     rating: t.rating,
-    position: t.position,
     published: t.publishedAt !== null,
     publishedAt: t.publishedAt ? t.publishedAt.toISOString() : null,
     showPartner: t.showPartner,
