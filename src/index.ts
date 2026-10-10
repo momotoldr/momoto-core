@@ -21,6 +21,7 @@ import { sweepStatsLimits } from './http/routes/stats.js'
 import { sweepTestimonialsLimits } from './http/routes/testimonials.js'
 import { sweepRemoveLimits, sweepStripLimits, sweepUnlockLimits } from './http/routes/strips.js'
 import { logger } from './lib/logger.js'
+import { sweepResolvedSupportTickets } from './lib/supportRetention.js'
 
 // Rooms, Socket.io and TURN credentials are served by momoto-realtime, not here.
 const app = createApp()
@@ -57,6 +58,10 @@ const sweeper = setInterval(() => {
   )
   void sweepPartnerInvites().catch((err) =>
     logger.error('partner.sweep.failed', { err: String(err) }),
+  )
+  // Resolved support tickets past retention (hourly; see lib/supportRetention.ts).
+  void sweepResolvedSupportTickets().catch((err) =>
+    logger.error('support.retention.failed', { err: String(err) }),
   )
 }, 30_000)
 sweeper.unref()

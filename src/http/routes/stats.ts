@@ -1,8 +1,8 @@
 import { Router } from 'express'
 
 import { env } from '../../config/env.js'
-import { prisma } from '../../db/client.js'
 import { clientIp } from '../../lib/clientIp.js'
+import { metricTotals } from '../../lib/dailyStats.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
 import { asyncRoute } from '../asyncRoute.js'
@@ -43,9 +43,9 @@ interface Totals {
    * stayed in a guest's browser and were never synced to an account, left no row to
    * count. The frontend shows it as "at least this many", which that is.
    *
-   * The same definition as `dateSessions + groupSessions` on `GET /admin/stats` — the
-   * filter and the (mode, code) pairing are copied from there on purpose, so the landing
-   * page and the operator dashboard can never disagree about the number.
+   * The same definition as `dateSessions + groupSessions` on `GET /admin/stats` — both
+   * read the `sessions:<mode>` counters, so the landing page and the operator dashboard
+   * can never disagree about the number.
    */
   sessions: number
   /** Strips created, ever — locked and unlocked alike. */
@@ -62,24 +62,15 @@ let cached: { at: number; value: Totals } | null = null
  */
 let inflight: Promise<Totals> | null = null
 
-/**
- * Counted in the database rather than with `groupBy(...).length` (which is how the admin
- * route gets the same figure): that would ship every distinct room code back to this
- * process just to measure the array. This endpoint is public, so it gets the version
- * whose cost doesn't grow with the answer.
- */
-async function countSharedSessions(): Promise<number> {
-  const rows = await prisma.$queryRaw<{ value: number }[]>`
-    SELECT count(DISTINCT ("sessionMode", "sessionId"))::int AS value
-    FROM "Strip"
-    WHERE "sessionMode" IN ('date', 'group') AND "sessionId" IS NOT NULL`
-  return rows[0]?.value ?? 0
-}
-
 function loadTotals(): Promise<Totals> {
-  inflight ??= Promise.all([prisma.user.count(), countSharedSessions(), prisma.strip.count()])
-    .then(([users, sessions, strips]) => {
-      const value: Totals = { users, sessions, strips }
+  // Off the trigger-kept `DailyStat` counters — a few index ranges, never a table count.
+  inflight ??= metricTotals(['users', 'strips', 'sessions:date', 'sessions:group'])
+    .then((total) => {
+      const value: Totals = {
+        users: total('users'),
+        sessions: total('sessions:date') + total('sessions:group'),
+        strips: total('strips'),
+      }
       cached = { at: Date.now(), value }
       return value
     })
