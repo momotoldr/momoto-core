@@ -18,7 +18,7 @@ export const testimonialsRouter = Router()
 
 /**
  * The landing page's "What people say" cards: exactly the testimonials an admin has
- * published, in the admin's order, and nothing else.
+ * published, newest first, and nothing else.
  *
  * There is one query and it only ever reads published rows, capped at
  * `MAX_PUBLISHED_TESTIMONIALS`. The route takes no parameters — no paging, no limit, no
@@ -68,7 +68,9 @@ type PublicTestimonial = {
 async function loadPublished(): Promise<PublicTestimonial[]> {
   const rows = await prisma.testimonial.findMany({
     where: { publishedAt: { not: null } },
-    orderBy: [{ position: 'asc' }, { createdAt: 'asc' }],
+    // Newest first. There's no hand-set order: with at most MAX_PUBLISHED published, the
+    // landing page shows them all anyway.
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     take: MAX_PUBLISHED_TESTIMONIALS,
     select: {
       id: true,

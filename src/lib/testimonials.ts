@@ -29,24 +29,25 @@ export const MIN_TESTIMONIALS_SHOWN = 3
 /** Matches the rating card's comment cap (`FEEDBACK_NOTE_MAX` in the frontend). */
 export const MAX_TESTIMONIAL_QUOTE = 500
 
-/** A rating needs at least this many stars to be featured. */
+/**
+ * A rating needs at least this many stars to be featured. Also written into the
+ * `feedback_testimonial_candidate` trigger (migration 20261010110000) — change both.
+ */
 export const MIN_TESTIMONIAL_RATING = 4
 
 /**
  * Whether a feedback row can become a testimonial: a star rating from the strip result
- * screen (category `feedback`), from a signed-in author, with a written comment, rated
+ * screen (or entered by an admin), from a signed-in author, with a written comment, rated
  * `MIN_TESTIMONIAL_RATING`+, and not already featured. The admin feedback route's
  * `eligibleFeedbackWhere` is the same rule as a database filter — keep them in step.
  */
 export function isEligibleFeedback(f: {
-  category: string
   hasAuthor: boolean
   message: string
   rating: number | null
   hasTestimonial: boolean
 }): boolean {
   return (
-    f.category === 'feedback' &&
     f.hasAuthor &&
     f.message.trim() !== '' &&
     f.rating !== null &&

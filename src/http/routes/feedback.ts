@@ -57,7 +57,11 @@ function oneOf(value: unknown, allowed: Set<string>): string | null {
   return typeof value === 'string' && allowed.has(value) ? value : null
 }
 
-// ── POST /feedback ─── store a feedback / support message ────────────────────
+// ── POST /feedback ─── store a rating/comment, or open a support ticket ───────
+//
+// One endpoint for both, as the app has always sent them: `category: 'support'` (the
+// support button) opens a `SupportTicket`; anything else is `Feedback` (the star rating
+// beside a finished strip). They're separate tables since 2026-10-10.
 feedbackRouter.post(
   '/',
   asyncRoute(async (req, res) => {
@@ -75,7 +79,9 @@ feedbackRouter.post(
 
     // A triage hint, so an unknown value is dropped rather than rejected — an older
     // client (or a topic added to the dialog before the server) still gets through.
-    const topic = category === 'support' ? oneOf(body.topic, SUPPORT_TOPICS) : null
+    const topic = oneOf(body.topic, SUPPORT_TOPICS)
+
+    const isSupport = category === 'support'
 
     let rating: number | null = null
     if (
@@ -91,7 +97,9 @@ feedbackRouter.post(
     // star rating beside a finished strip is one tap with no comment attached, so an
     // empty message is a valid row as long as a rating came with it.
     const message = typeof body.message === 'string' ? body.message.trim() : ''
-    if (message.length > MAX_MESSAGE || (message.length === 0 && rating === null)) {
+    // A support ticket is the message; a rating is the only thing that stands alone.
+    const empty = message.length === 0 && (isSupport || rating === null)
+    if (message.length > MAX_MESSAGE || empty) {
       res.status(400).json({ error: 'invalid_input' })
       return
     }
@@ -120,6 +128,21 @@ feedbackRouter.post(
 
     const userId = optionalUserId(req)
 
+    if (isSupport) {
+      const ticket = await prisma.supportTicket.create({
+        data: { userId, topic, message, email, context, analyticsSessionId, userAgent, lang },
+        select: { ticketNumber: true },
+      })
+      logger.info('support.received', {
+        ticketNumber: ticket.ticketNumber,
+        topic: topic ?? undefined,
+        hasEmail: Boolean(email),
+        userId: userId ?? undefined,
+      })
+      res.status(201).json({ ok: true })
+      return
+    }
+
     // Read from the link, never from the body: a couple testimonial shows this person,
     // so the client must not be able to name someone.
     const partnerUserId = userId
@@ -130,8 +153,6 @@ feedbackRouter.post(
     await prisma.feedback.create({
       data: {
         userId,
-        category,
-        topic,
         rating,
         message,
         email,
@@ -144,8 +165,6 @@ feedbackRouter.post(
       },
     })
     logger.info('feedback.received', {
-      category,
-      topic: topic ?? undefined,
       rating: rating ?? undefined,
       hasEmail: Boolean(email),
       userId: userId ?? undefined,

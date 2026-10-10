@@ -898,10 +898,11 @@ authRouter.delete(
 // Self-service account deletion. For an account that has a password, we re-verify
 // it here: an access token alone (which could be lingering on a shared device)
 // shouldn't be enough to erase an account. Google-only accounts have no password to
-// check — the valid session is the proof. The delete cascades the user's strip rows,
-// refresh tokens and partner invites, unlinks any partner, and detaches feedback (kept
-// for triage); their payment records are removed with the account. The strips' images
-// and the avatar live in object storage, which doesn't cascade — they're deleted after.
+// check — the valid session is the proof. Payments don't block it. The delete cascades
+// the user's strip rows, refresh tokens and partner invites, unlinks any partner, and
+// detaches feedback (kept for triage) and payments (the record of money received — there
+// are no refunds). The strips' images and the avatar live in object storage, which
+// doesn't cascade — they're deleted after.
 authRouter.delete(
   '/me',
   requireAuth,

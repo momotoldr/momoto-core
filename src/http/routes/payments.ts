@@ -314,7 +314,12 @@ paymentsRouter.post(
       // refused anything that wouldn't fit, so landing over the cap means the gallery filled
       // between the two — rare, tolerated, and logged rather than enforced. The overflow
       // drains itself: the next unlock is refused until the user frees a slot.
-      const room = await galleryRoomFor(payment.userId, stripIds.length)
+      // No owner means they deleted their account while this was pending: there's no
+      // gallery to fit into (their strips went with them), but the money was still taken,
+      // so it settles as paid like any other — it's the record of what we received.
+      const room = payment.userId
+        ? await galleryRoomFor(payment.userId, stripIds.length)
+        : ({ ok: true } as const)
       if (!room.ok) {
         logger.warn('gallery.overCap', {
           orderId,

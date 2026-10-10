@@ -1,11 +1,18 @@
 import { Prisma } from '@prisma/client'
-import { Router } from 'express'
+import { type Response, Router } from 'express'
 
 import { hashPassword } from '../../auth/passwords.js'
 import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
 import { clientIp } from '../../lib/clientIp.js'
 import { isValidEmail } from '../../lib/email.js'
+import {
+  metricDays,
+  metricSumBetween,
+  metricSums,
+  metricTotals,
+  utcDaysAgo,
+} from '../../lib/dailyStats.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
 import {
@@ -24,6 +31,7 @@ import {
   serializeAdminFeedback,
   serializeAdminPayment,
   serializeAdminStrip,
+  serializeAdminSupportTicket,
   serializeAdminTestimonial,
   serializeAdminUser,
   serializeUserSummary,
@@ -75,8 +83,67 @@ const userRowSelect = {
   cityName: true,
   createdAt: true,
   updatedAt: true,
-  _count: { select: { strips: true, payments: true, feedbacks: true } },
 } as const
+
+// ── Related-row counts ────────────────────────────────────────────────────────
+//
+// Not Prisma's `_count` select: it compiles to a LEFT JOIN against a GROUP BY over
+// the *whole* related table, however few rows the outer query keeps — a full scan
+// of Strip/Payment/Feedback (or the payment↔strip join table) on every request.
+// These count only the rows on hand, through their indexed foreign keys.
+
+/** Attach each user's strip/payment/feedback counts, as `serializeAdminUser` reads them. */
+async function withUserCounts<T extends { id: string }>(
+  users: T[],
+): Promise<
+  (T & {
+    _count: { strips: number; payments: number; feedbacks: number; supportTickets: number }
+  })[]
+> {
+  const ids = users.map((u) => u.id)
+  const where = { userId: { in: ids } }
+  const [strips, payments, feedbacks, tickets] = ids.length
+    ? await Promise.all([
+        prisma.strip.groupBy({ by: ['userId'], where, _count: { _all: true } }),
+        prisma.payment.groupBy({ by: ['userId'], where, _count: { _all: true } }),
+        prisma.feedback.groupBy({ by: ['userId'], where, _count: { _all: true } }),
+        prisma.supportTicket.groupBy({ by: ['userId'], where, _count: { _all: true } }),
+      ])
+    : [[], [], [], []]
+  const tally = (groups: { userId: string | null; _count: { _all: number } }[]) =>
+    new Map(groups.map((g) => [g.userId, g._count._all]))
+  const [s, p, f, t] = [tally(strips), tally(payments), tally(feedbacks), tally(tickets)]
+  return users.map((u) => ({
+    ...u,
+    _count: {
+      strips: s.get(u.id) ?? 0,
+      payments: p.get(u.id) ?? 0,
+      feedbacks: f.get(u.id) ?? 0,
+      supportTickets: t.get(u.id) ?? 0,
+    },
+  }))
+}
+
+/** `withUserCounts` for one user. */
+async function withUserCount<T extends { id: string }>(user: T) {
+  const [counted] = await withUserCounts([user])
+  return counted!
+}
+
+/** Attach each payment's strip count, as `serializeAdminPayment` reads it. */
+async function withStripCounts<T extends { id: string }>(
+  payments: T[],
+): Promise<(T & { _count: { strips: number } })[]> {
+  const ids = payments.map((p) => p.id)
+  // Implicit many-to-many: "A" is the Payment id, led by the (A, B) primary key.
+  const rows = ids.length
+    ? await prisma.$queryRaw<{ paymentId: string; n: number }[]>`
+        SELECT "A" AS "paymentId", count(*)::int AS n
+        FROM "_PaymentToStrip" WHERE "A" = ANY(${ids}) GROUP BY "A"`
+    : []
+  const counts = new Map(rows.map((r) => [r.paymentId, r.n]))
+  return payments.map((p) => ({ ...p, _count: { strips: counts.get(p.id) ?? 0 } }))
+}
 
 /** The embedded "who" reference on a payment/feedback/strip/session row. */
 const userSummarySelect = { id: true, username: true, displayName: true } as const
@@ -93,13 +160,11 @@ const testimonialPersonSelect = {
 
 /**
  * Feedback that can be featured — the database form of `isEligibleFeedback` in
- * `lib/testimonials.ts`; keep the two in step.
+ * `lib/testimonials.ts`. `testimonialCandidate` is its row-level half (author, comment,
+ * MIN_TESTIMONIAL_RATING+), kept by a trigger and indexed, so this reads candidates only.
  */
 const eligibleFeedbackWhere = {
-  category: 'feedback',
-  userId: { not: null },
-  message: { not: '' },
-  rating: { gte: MIN_TESTIMONIAL_RATING },
+  testimonialCandidate: true,
   testimonial: { is: null },
 } satisfies Prisma.FeedbackWhereInput
 
@@ -114,26 +179,128 @@ const USERNAME_RE = /^[a-z0-9]{3,20}$/
 const MIN_PASSWORD = 8
 const MAX_DISPLAY_NAME = 60
 
-/** Offset pagination shared by every list endpoint. `limit` is capped at 100. */
-function parsePagination(query: Record<string, unknown>): {
-  page: number
+/** Shortest admin user search — one trigram, the least the pg_trgm indexes can use. */
+const MIN_USER_SEARCH = 3
+
+// ── List pagination: keyset ("load more") + time range ──────────────────────────
+//
+// Every list is newest-first on (createdAt, id) and pages by keyset, not OFFSET:
+// the client hands back the opaque `nextCursor` from the last batch and the query
+// seeks straight to it on the (createdAt, id) index. No OFFSET scan, and no COUNT —
+// lists answer "is there more?" by fetching one extra row.
+
+/** Where the previous batch ended: its last row's sort key. */
+interface ListCursor {
+  at: Date
+  id: string
+}
+
+class InvalidListQuery extends Error {}
+
+function encodeCursor(at: Date, id: string): string {
+  return Buffer.from(`${at.toISOString()}|${id}`).toString('base64url')
+}
+
+function decodeCursor(raw: string): ListCursor {
+  const [iso, id] = Buffer.from(raw, 'base64url').toString().split('|')
+  const at = new Date(iso ?? '')
+  if (!id || Number.isNaN(at.getTime())) throw new InvalidListQuery('invalid_cursor')
+  return { at, id }
+}
+
+function parseDate(value: unknown): Date | undefined {
+  if (typeof value !== 'string' || !value) return undefined
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) throw new InvalidListQuery('invalid_range')
+  return d
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000
+/** A list with no `from` covers the day before `to` (or now). */
+const DEFAULT_RANGE_MS = DAY_MS
+/**
+ * The widest window a list may cover — keeps every list query bounded. The portal's
+ * custom-range picker clamps to the same (momoto-portal `MAX_RANGE_DAYS`): change both.
+ */
+const MAX_RANGE_MS = 30 * DAY_MS
+/** Leeway on the cap for client clock skew and a custom range's end-of-day bound. */
+const RANGE_SLACK_MS = DAY_MS
+
+/**
+ * `limit` (default 50, capped at 100), `cursor`, and the `from`/`to` time range (ISO instants,
+ * both inclusive) shared by every list endpoint. The range is always bounded:
+ * `from` defaults to a day before `to`, `to` to now, and a window wider than
+ * `MAX_RANGE_MS` is refused. `unbounded` drops the range entirely — for a direct
+ * lookup (a search) that must reach old rows. Throws `InvalidListQuery` on a
+ * malformed cursor or range — see `listRoute`.
+ */
+function parseListQuery(
+  query: Record<string, unknown>,
+  { unbounded = false }: { unbounded?: boolean } = {},
+): {
   limit: number
-  skip: number
-  take: number
+  cursor: ListCursor | null
+  range: { gte: Date; lte?: Date } | undefined
 } {
-  const page = Math.max(1, toInt(query.page, 1))
-  const limit = Math.min(100, Math.max(1, toInt(query.limit, 25)))
-  return { page, limit, skip: (page - 1) * limit, take: limit }
+  // 50 rows per page by default — one page of the portal's Prev / Next tables.
+  const limit = Math.min(100, Math.max(1, toInt(query.limit, 50)))
+  const cursor =
+    typeof query.cursor === 'string' && query.cursor ? decodeCursor(query.cursor) : null
+  if (unbounded) return { limit, cursor, range: undefined }
+
+  const lte = parseDate(query.to)
+  const end = lte ?? new Date()
+  const gte = parseDate(query.from) ?? new Date(end.getTime() - DEFAULT_RANGE_MS)
+  if (gte > end) throw new InvalidListQuery('invalid_range')
+  if (end.getTime() - gte.getTime() > MAX_RANGE_MS + RANGE_SLACK_MS) {
+    throw new InvalidListQuery('range_too_wide')
+  }
+  return { limit, cursor, range: lte ? { gte, lte } : { gte } }
 }
 
-/** A day/value point in a stats trend series. */
-interface TrendPoint {
-  day: string
-  value: number
+/** Rows strictly after `cursor` in (createdAt desc, id desc) order. */
+function afterCursor(cursor: ListCursor | null) {
+  return cursor
+    ? {
+        // The plain `lte` bound is what lets the index *start* at the cursor. The OR
+        // alone is correct but can't seed an index range, so Postgres would walk from
+        // the newest row and skip every earlier page — page N costing N pages.
+        createdAt: { lte: cursor.at },
+        OR: [{ createdAt: { lt: cursor.at } }, { createdAt: cursor.at, id: { lt: cursor.id } }],
+      }
+    : {}
 }
 
-function toTrend(rows: { day: Date; value: number }[]): TrendPoint[] {
-  return rows.map((r) => ({ day: r.day.toISOString().slice(0, 10), value: r.value }))
+/** The keyset sort every list uses; `afterCursor` must match it. */
+const newestFirst = [{ createdAt: 'desc' as const }, { id: 'desc' as const }]
+
+/**
+ * Trim a `limit + 1` fetch to `limit` rows and derive the cursor for the next batch
+ * (null when the extra row didn't come back, i.e. this is the last batch).
+ */
+function keysetPage<T extends { createdAt: Date; id: string }>(
+  rows: T[],
+  limit: number,
+): { rows: T[]; nextCursor: string | null } {
+  if (rows.length <= limit) return { rows, nextCursor: null }
+  const page = rows.slice(0, limit)
+  const last = page[page.length - 1]!
+  return { rows: page, nextCursor: encodeCursor(last.createdAt, last.id) }
+}
+
+/** Run a list handler, answering 400 for a bad cursor or date instead of a 500. */
+function listRoute(handler: (query: Record<string, unknown>, res: Response) => Promise<void>) {
+  return asyncRoute(async (req, res) => {
+    try {
+      await handler(req.query as Record<string, unknown>, res)
+    } catch (err) {
+      if (err instanceof InvalidListQuery) {
+        res.status(400).json({ error: err.message })
+        return
+      }
+      throw err
+    }
+  })
 }
 
 // ── GET /admin/me ─── confirm admin access + return the operator's profile ──────
@@ -144,218 +311,186 @@ adminRouter.get(
       where: { id: req.userId },
       select: userRowSelect,
     })
-    res.json({ user: serializeAdminUser(user) })
+    res.json({ user: serializeAdminUser(await withUserCount(user)) })
   }),
 )
 
+/** Every counter the overview reads — fetched by key, see `metricSums`. */
+const OVERVIEW_METRICS = [
+  'users',
+  'strips',
+  'strips:solo',
+  'strips:date',
+  'strips:group',
+  'feedback',
+  'rating:1',
+  'rating:2',
+  'rating:3',
+  'rating:4',
+  'rating:5',
+  'support',
+  'support:open',
+  'revenue',
+  'paid_orders',
+  'sessions:date',
+  'sessions:group',
+] as const
+
 // ── GET /admin/stats ─── overview KPIs + trends ─────────────────────────────────
+//
+// Every figure but the recent-support list comes off the `DailyStat` counters (kept by
+// database triggers), so the overview never counts a whole table. Windows are UTC
+// calendar days: "last 7" is today plus the 6 days before.
 adminRouter.get(
   '/stats',
   asyncRoute(async (_req, res) => {
-    const now = Date.now()
-    const since7 = new Date(now - 7 * 24 * 60 * 60_000)
-    const since30 = new Date(now - 30 * 24 * 60 * 60_000)
-    const paid = { status: 'paid' as const }
+    const now = new Date()
+    const trendSince = utcDaysAgo(29, now)
 
-    const [
-      users,
-      usersLast7,
-      usersLast30,
-      strips,
-      stripsLast7,
-      stripsLast30,
-      feedback,
-      revenueAll,
-      revenueLast7,
-      revenueLast30,
-      modeGroups,
-      roomSessionGroups,
-      feedbackByCategory,
-      ratingGroups,
-      ratingAvg,
-      recentSupport,
-      signupTrendRaw,
-      stripTrendRaw,
-      revenueTrendRaw,
-    ] = await Promise.all([
-      prisma.user.count(),
-      prisma.user.count({ where: { createdAt: { gte: since7 } } }),
-      prisma.user.count({ where: { createdAt: { gte: since30 } } }),
-      prisma.strip.count(),
-      prisma.strip.count({ where: { createdAt: { gte: since7 } } }),
-      prisma.strip.count({ where: { createdAt: { gte: since30 } } }),
-      prisma.feedback.count(),
-      prisma.payment.aggregate({ where: paid, _sum: { grossAmount: true }, _count: true }),
-      prisma.payment.aggregate({
-        where: { ...paid, paidAt: { gte: since7 } },
-        _sum: { grossAmount: true },
-      }),
-      prisma.payment.aggregate({
-        where: { ...paid, paidAt: { gte: since30 } },
-        _sum: { grossAmount: true },
-      }),
-      prisma.strip.groupBy({ by: ['sessionMode'], _count: { _all: true } }),
-      prisma.strip.groupBy({
-        by: ['sessionMode', 'sessionId'],
-        where: { sessionMode: { in: ['date', 'group'] }, sessionId: { not: null } },
-      }),
-      prisma.feedback.groupBy({ by: ['category'], _count: { _all: true } }),
-      prisma.feedback.groupBy({
-        by: ['rating'],
-        where: { rating: { not: null } },
-        _count: { _all: true },
-      }),
-      prisma.feedback.aggregate({ where: { rating: { not: null } }, _avg: { rating: true } }),
-      prisma.feedback.findMany({
-        where: { category: 'support' },
-        orderBy: { createdAt: 'desc' },
+    const [sums, recentSupport, signupTrend, stripTrend, revenueTrend] = await Promise.all([
+      metricSums(OVERVIEW_METRICS, now),
+      prisma.supportTicket.findMany({
+        orderBy: newestFirst,
         take: 5,
-        select: feedbackRowSelect,
+        select: supportRowSelect,
       }),
-      prisma.$queryRaw<{ day: Date; value: number }[]>`
-        SELECT date_trunc('day', "createdAt") AS day, count(*)::int AS value
-        FROM "User" WHERE "createdAt" >= ${since30} GROUP BY day ORDER BY day`,
-      prisma.$queryRaw<{ day: Date; value: number }[]>`
-        SELECT date_trunc('day', "createdAt") AS day, count(*)::int AS value
-        FROM "Strip" WHERE "createdAt" >= ${since30} GROUP BY day ORDER BY day`,
-      prisma.$queryRaw<{ day: Date; value: number }[]>`
-        SELECT date_trunc('day', "paidAt") AS day, coalesce(sum("grossAmount"), 0)::int AS value
-        FROM "Payment" WHERE "status" = 'paid' AND "paidAt" >= ${since30}
-        GROUP BY day ORDER BY day`,
+      metricDays('users', trendSince),
+      metricDays('strips', trendSince),
+      metricDays('revenue', trendSince),
     ])
+    const total = (metric: string) => sums(metric).total
 
     // `unknown` is for strips saved before the mode was recorded. A mode the app *does*
     // have must get its own bucket, or it silently reads as missing data — which is what
     // group strips did when they first shipped.
-    const modeSplit = { solo: 0, date: 0, group: 0, unknown: 0 }
-    for (const g of modeGroups) {
-      if (g.sessionMode === 'solo') modeSplit.solo += g._count._all
-      else if (g.sessionMode === 'date') modeSplit.date += g._count._all
-      else if (g.sessionMode === 'group') modeSplit.group += g._count._all
-      else modeSplit.unknown += g._count._all
+    const modeSplit = {
+      solo: total('strips:solo'),
+      date: total('strips:date'),
+      group: total('strips:group'),
+      unknown: 0,
     }
-    // Distinct room codes, split by the kind of room. Solo strips carry no shared
-    // session id, so they are never counted here.
-    const dateSessions = roomSessionGroups.filter((g) => g.sessionMode === 'date').length
-    const groupSessions = roomSessionGroups.filter((g) => g.sessionMode === 'group').length
-
-    // Feedback split by category ("feedback" | "support"), free-form so fall back to 0.
-    const byCategory = { feedback: 0, support: 0 }
-    for (const g of feedbackByCategory) {
-      if (g.category === 'feedback') byCategory.feedback += g._count._all
-      else if (g.category === 'support') byCategory.support += g._count._all
-    }
+    modeSplit.unknown = total('strips') - modeSplit.solo - modeSplit.date - modeSplit.group
 
     // Rating distribution 1..5 (ratings are optional; only present ones counted).
-    const ratingCounts: Record<1 | 2 | 3 | 4 | 5, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 }
-    for (const g of ratingGroups) {
-      const r = g.rating
-      if (r !== null && r >= 1 && r <= 5) ratingCounts[r as 1 | 2 | 3 | 4 | 5] += g._count._all
+    const ratingCounts = {
+      1: total('rating:1'),
+      2: total('rating:2'),
+      3: total('rating:3'),
+      4: total('rating:4'),
+      5: total('rating:5'),
     }
+    const rated = Object.values(ratingCounts).reduce((a, b) => a + b, 0)
+    const ratingSum = Object.entries(ratingCounts).reduce((a, [r, n]) => a + Number(r) * n, 0)
 
     res.json({
-      users: { total: users, last7: usersLast7, last30: usersLast30 },
-      strips: { total: strips, last7: stripsLast7, last30: stripsLast30 },
+      users: sums('users'),
+      strips: sums('strips'),
       feedback: {
-        total: feedback,
-        byCategory,
+        total: total('feedback'),
         ratingCounts,
-        averageRating: ratingAvg._avg.rating,
-        recentSupport: recentSupport.map(serializeAdminFeedback),
+        averageRating: rated ? ratingSum / rated : null,
+      },
+      support: {
+        total: total('support'),
+        open: total('support:open'),
+        recent: recentSupport.map(serializeAdminSupportTicket),
       },
       revenue: {
         // Whole rupiah (see STRIP_PRINT_PRICE_IDR) — no minor unit.
-        total: revenueAll._sum.grossAmount ?? 0,
-        last7: revenueLast7._sum.grossAmount ?? 0,
-        last30: revenueLast30._sum.grossAmount ?? 0,
-        paidOrders: revenueAll._count,
+        ...sums('revenue'),
+        paidOrders: total('paid_orders'),
       },
       sessions: {
-        // Distinct date-room codes with at least one saved strip. Solo strips have no
-        // distinct id, so they're not grouped — the exact solo/date split is `modeSplit`.
-        dateSessions,
-        groupSessions,
+        // Date and group rooms with at least one saved strip. Solo isn't counted — the
+        // exact strip split by mode is `stripsByMode`.
+        dateSessions: total('sessions:date'),
+        groupSessions: total('sessions:group'),
         stripsByMode: modeSplit,
       },
-      trends: {
-        signups: toTrend(signupTrendRaw),
-        strips: toTrend(stripTrendRaw),
-        revenue: toTrend(revenueTrendRaw),
-      },
+      trends: { signups: signupTrend, strips: stripTrend, revenue: revenueTrend },
     })
   }),
 )
 
-// ── GET /admin/sessions ─── photo sessions derived from strips ──────────────────
+// ── GET /admin/sessions ─── photo sessions (room codes with saved strips) ───────
+//
+// Read from the `Session` summary table, newest-first by last strip; the keyset is
+// that (lastAt, id) pair. The time range picks sessions whose last strip falls in it.
 adminRouter.get(
   '/sessions',
-  asyncRoute(async (req, res) => {
-    const query = req.query as Record<string, unknown>
-    const { page, limit, skip, take } = parsePagination(query)
+  listRoute(async (query, res) => {
+    const { limit, cursor, range } = parseListQuery(query)
     const mode = typeof query.mode === 'string' ? query.mode : ''
-    const modeWhere = SESSION_MODES.has(mode) ? { sessionMode: mode } : {}
-    const where = { sessionId: { not: null }, ...modeWhere }
 
-    const [groups, allGroups] = await Promise.all([
-      prisma.strip.groupBy({
-        by: ['sessionId'],
-        where,
-        _count: { _all: true },
-        _min: { createdAt: true },
-        _max: { createdAt: true },
-        orderBy: { _max: { createdAt: 'desc' } },
-        skip,
-        take,
-      }),
-      // Total distinct sessions matching the filter (small dataset — length is fine).
-      prisma.strip.groupBy({ by: ['sessionId'], where }),
-    ])
+    const rows = await prisma.session.findMany({
+      where: {
+        AND: [
+          SESSION_MODES.has(mode) ? { mode } : {},
+          range ? { lastAt: range } : {},
+          cursor
+            ? {
+                // `lte` lets the index start at the cursor — see `afterCursor`.
+                lastAt: { lte: cursor.at },
+                OR: [{ lastAt: { lt: cursor.at } }, { lastAt: cursor.at, id: { lt: cursor.id } }],
+              }
+            : {},
+        ],
+      },
+      orderBy: [{ lastAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
+    })
+    const sessions = rows.slice(0, limit)
+    const last = sessions[sessions.length - 1]
+    const nextCursor = rows.length > limit && last ? encodeCursor(last.lastAt, last.id) : null
 
-    // Enrich the page's sessions with mode + contributing users (a date room's two
-    // members each save strips under the same room-code sessionId).
-    const ids = groups.map((g) => g.sessionId).filter((v): v is string => v !== null)
-    const strips = ids.length
-      ? await prisma.strip.findMany({
-          where: { sessionId: { in: ids } },
-          select: { sessionId: true, sessionMode: true, user: { select: userSummarySelect } },
+    // Who took part: one SessionMember row per person per session (a date room's two
+    // members each save strips under the same room-code sessionId), then their names.
+    const members = sessions.length
+      ? await prisma.sessionMember.findMany({
+          where: { sessionId: { in: sessions.map((x) => x.id) } },
+          select: { sessionId: true, userId: true },
         })
       : []
-
-    const meta = new Map<
-      string,
-      { mode: string | null; users: Map<string, ReturnType<typeof serializeUserSummary>> }
-    >()
-    for (const s of strips) {
-      if (!s.sessionId) continue
-      const entry = meta.get(s.sessionId) ?? { mode: s.sessionMode, users: new Map() }
-      entry.users.set(s.user.id, serializeUserSummary(s.user))
-      meta.set(s.sessionId, entry)
+    const people = members.length
+      ? await prisma.user.findMany({
+          where: { id: { in: [...new Set(members.map((m) => m.userId))] } },
+          select: userSummarySelect,
+        })
+      : []
+    const byId = new Map(people.map((p) => [p.id, serializeUserSummary(p)]))
+    const users = new Map<string, ReturnType<typeof serializeUserSummary>[]>()
+    for (const m of members) {
+      const person = byId.get(m.userId)
+      if (person) users.set(m.sessionId, [...(users.get(m.sessionId) ?? []), person])
     }
 
-    const items = groups.map((g) => {
-      const info = g.sessionId ? meta.get(g.sessionId) : undefined
-      return {
-        sessionId: g.sessionId,
-        sessionMode: info?.mode ?? null,
-        stripCount: g._count._all,
-        firstAt: g._min.createdAt?.toISOString() ?? null,
-        lastAt: g._max.createdAt?.toISOString() ?? null,
-        users: info ? [...info.users.values()] : [],
-      }
-    })
+    const items = sessions.map((x) => ({
+      sessionId: x.id,
+      sessionMode: x.mode,
+      stripCount: x.stripCount,
+      firstAt: x.firstAt.toISOString(),
+      lastAt: x.lastAt.toISOString(),
+      users: users.get(x.id) ?? [],
+    }))
 
-    res.json({ items, total: allGroups.length, page, limit })
+    res.json({ items, nextCursor, limit })
   }),
 )
 
-// ── GET /admin/users ─── searchable, paginated users table ──────────────────────
+// ── GET /admin/users ─── searchable users table (by signup time) ────────────────
 adminRouter.get(
   '/users',
-  asyncRoute(async (req, res) => {
-    const query = req.query as Record<string, unknown>
-    const { page, limit, skip, take } = parsePagination(query)
+  listRoute(async (query, res) => {
     const q = typeof query.q === 'string' ? query.q.trim() : ''
-    const where = q
+    // The trigram indexes behind this `contains` need 3+ characters; anything shorter
+    // would fall back to scanning every account, so it's refused instead.
+    if (q && q.length < MIN_USER_SEARCH) {
+      res.status(400).json({ error: 'search_too_short' })
+      return
+    }
+    // A search looks up a specific account, so it reaches past the time range.
+    const { limit, cursor, range } = parseListQuery(query, { unbounded: q !== '' })
+    const search = q
       ? {
           OR: [
             { username: { contains: q, mode: 'insensitive' as const } },
@@ -365,18 +500,15 @@ adminRouter.get(
         }
       : {}
 
-    const [items, total] = await Promise.all([
-      prisma.user.findMany({
-        where,
-        select: userRowSelect,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take,
-      }),
-      prisma.user.count({ where }),
-    ])
+    const rows = await prisma.user.findMany({
+      where: { AND: [search, range ? { createdAt: range } : {}, afterCursor(cursor)] },
+      select: userRowSelect,
+      orderBy: newestFirst,
+      take: limit + 1,
+    })
+    const { rows: items, nextCursor } = keysetPage(rows, limit)
 
-    res.json({ items: items.map(serializeAdminUser), total, page, limit })
+    res.json({ items: (await withUserCounts(items)).map(serializeAdminUser), nextCursor, limit })
   }),
 )
 
@@ -439,7 +571,7 @@ adminRouter.post(
       where: { id: created.id },
       select: userRowSelect,
     })
-    res.status(201).json({ user: serializeAdminUser(user) })
+    res.status(201).json({ user: serializeAdminUser(await withUserCount(user)) })
   }),
 )
 
@@ -459,7 +591,7 @@ adminRouter.get(
       return
     }
 
-    const [strips, payments, feedback] = await Promise.all([
+    const [strips, payments, feedback, support] = await Promise.all([
       prisma.strip.findMany({
         where: { userId: user.id },
         orderBy: { createdAt: 'desc' },
@@ -494,7 +626,6 @@ adminRouter.get(
           updatedAt: true,
           paidAt: true,
           user: { select: userSummarySelect },
-          _count: { select: { strips: true } },
         },
       }),
       prisma.feedback.findMany({
@@ -503,25 +634,32 @@ adminRouter.get(
         take: 10,
         select: feedbackRowSelect,
       }),
+      prisma.supportTicket.findMany({
+        where: { userId: user.id },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+        select: supportRowSelect,
+      }),
     ])
 
     res.json({
-      user: serializeAdminUser(user),
+      user: serializeAdminUser(await withUserCount(user)),
       partner: user.partner ? serializeUserSummary(user.partner) : null,
       recent: {
         strips: strips.map(serializeAdminStrip),
-        payments: payments.map(serializeAdminPayment),
+        payments: (await withStripCounts(payments)).map(serializeAdminPayment),
         feedback: feedback.map(serializeAdminFeedback),
+        support: support.map(serializeAdminSupportTicket),
       },
     })
   }),
 )
 
 // ── DELETE /admin/users/:id ─── remove an account ───────────────────────────────
-// Guardrails: an admin can't delete themselves, and a user with settled/pending
-// payment records is protected (deleting cascades those rows away — we keep the
-// financial history). Everything else (strips, avatar, tokens) cascades; feedback
-// is detached (userId → null) so support history survives. Testimonials the account
+// Guardrails: an admin can't delete themselves, and an account with payment records
+// is refused here — only its owner can delete it (`DELETE /auth/me`). Strips, avatar
+// and tokens cascade; feedback, support tickets and payments are detached
+// (userId → null), so that history survives the account. Testimonials the account
 // authored cascade away; ones where it was the partner fall back to solo (SetNull).
 adminRouter.delete(
   '/users/:id',
@@ -593,28 +731,79 @@ adminRouter.patch(
     await prisma.user.update({ where: { id }, data: { role } })
     logger.info('admin.user.role_changed', { by: req.userId, userId: id, role })
     const user = await prisma.user.findUniqueOrThrow({ where: { id }, select: userRowSelect })
-    res.json({ user: serializeAdminUser(user) })
+    res.json({ user: serializeAdminUser(await withUserCount(user)) })
   }),
 )
 
+// ── Settled revenue for a Transactions filter ─────────────────────────────────
+//
+// Paid payments' gross amount, by *when they were paid* (creation time for a paid row
+// with no `paidAt`) — the same bucketing as the `revenue` DailyStat counter, so the
+// Overview and this agree. Only "paid" is settled: any other status filter is Rp 0.
+//
+// Whole UTC days come off the counter; only the range's partial first and last day
+// are summed from Payment, each at most one day of rows on the paidAt / createdAt
+// indexes. So the cost is days-in-range counter rows plus ≤ 2 days of payments,
+// whatever the sales volume.
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000
+
+/** UTC midnight at or before `at`. */
+function utcDayStart(at: Date): Date {
+  return new Date(Math.floor(at.getTime() / MS_PER_DAY) * MS_PER_DAY)
+}
+
+/** Paid revenue with a payment time in [gte, lt) or [gte, lte] — a sub-day slice. */
+async function liveRevenue(window: { gte: Date; lt?: Date; lte?: Date }): Promise<number> {
+  const { _sum } = await prisma.payment.aggregate({
+    where: {
+      status: 'paid',
+      OR: [{ paidAt: window }, { paidAt: null, createdAt: window }],
+    },
+    _sum: { grossAmount: true },
+  })
+  return _sum.grossAmount ?? 0
+}
+
+async function settledRevenue(
+  range: { gte: Date; lte?: Date } | undefined,
+  status: string | undefined,
+): Promise<number> {
+  if (status && status !== 'paid') return 0
+  // Lists are always ranged (parseListQuery); all-time is the counter's total.
+  if (!range) return (await metricTotals(['revenue']))('revenue')
+
+  const { gte: from, lte: to } = range
+  // First whole day: `from` itself when it's a UTC midnight, else the next one.
+  const fromDay = utcDayStart(from)
+  const wholeFrom =
+    fromDay.getTime() === from.getTime() ? from : new Date(fromDay.getTime() + MS_PER_DAY)
+  // End (exclusive) of the whole days: with no `to` the range runs to now, so every
+  // day through today is whole — nothing later exists yet.
+  const wholeTo = to ? utcDayStart(new Date(to.getTime() + 1)) : undefined
+
+  if (wholeTo && wholeTo <= wholeFrom) return liveRevenue({ gte: from, lte: to })
+
+  const [head, days, tail] = await Promise.all([
+    from < wholeFrom ? liveRevenue({ gte: from, lt: wholeFrom }) : 0,
+    metricSumBetween('revenue', wholeFrom, wholeTo),
+    to && wholeTo && wholeTo <= to ? liveRevenue({ gte: wholeTo, lte: to }) : 0,
+  ])
+  return head + days + tail
+}
+
 // ── GET /admin/payments ─── transactions table + revenue for the filter ─────────
+//
+// `revenue` comes with the first batch only (no cursor) — a "load more" doesn't
+// change the filter, so it doesn't re-sum it. See `settledRevenue`.
 adminRouter.get(
   '/payments',
-  asyncRoute(async (req, res) => {
-    const query = req.query as Record<string, unknown>
-    const { page, limit, skip, take } = parsePagination(query)
+  listRoute(async (query, res) => {
+    const { limit, cursor, range } = parseListQuery(query)
     const status = typeof query.status === 'string' && query.status ? query.status : undefined
-
-    const createdAt: { gte?: Date; lte?: Date } = {}
-    if (typeof query.from === 'string' && !Number.isNaN(Date.parse(query.from))) {
-      createdAt.gte = new Date(query.from)
-    }
-    if (typeof query.to === 'string' && !Number.isNaN(Date.parse(query.to))) {
-      createdAt.lte = new Date(query.to)
-    }
     const where = {
       ...(status ? { status } : {}),
-      ...(createdAt.gte || createdAt.lte ? { createdAt } : {}),
+      ...(range ? { createdAt: range } : {}),
     }
 
     const paymentSelect = {
@@ -628,88 +817,69 @@ adminRouter.get(
       updatedAt: true,
       paidAt: true,
       user: { select: userSummarySelect },
-      _count: { select: { strips: true } },
     } as const
 
-    const [items, total, revenue] = await Promise.all([
+    const [rows, revenue] = await Promise.all([
       prisma.payment.findMany({
-        where,
+        where: { AND: [where, afterCursor(cursor)] },
         select: paymentSelect,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take,
+        orderBy: newestFirst,
+        take: limit + 1,
       }),
-      prisma.payment.count({ where }),
-      // Settled revenue within the current filter.
-      prisma.payment.aggregate({
-        where: { ...where, status: 'paid' },
-        _sum: { grossAmount: true },
-      }),
+      cursor ? null : settledRevenue(range, status),
     ])
+    const { rows: items, nextCursor } = keysetPage(rows, limit)
 
     res.json({
-      items: items.map(serializeAdminPayment),
-      total,
-      page,
+      items: (await withStripCounts(items)).map(serializeAdminPayment),
+      nextCursor,
       limit,
-      revenue: revenue._sum.grossAmount ?? 0,
+      ...(revenue !== null ? { revenue } : {}),
     })
   }),
 )
 
-// ── GET /admin/feedback ─── feedback / support inbox ────────────────────────────
+// ── GET /admin/feedback ─── ratings & comments inbox ──────────────────────────────
 adminRouter.get(
   '/feedback',
-  asyncRoute(async (req, res) => {
-    const query = req.query as Record<string, unknown>
-    const { page, limit, skip, take } = parsePagination(query)
-    const category =
-      typeof query.category === 'string' && query.category ? query.category : undefined
-    const topic = typeof query.topic === 'string' && query.topic ? query.topic : undefined
+  listRoute(async (query, res) => {
+    const { limit, cursor, range } = parseListQuery(query)
     const ratingInt = toInt(query.rating, 0)
     const rating = ratingInt >= 1 && ratingInt <= 5 ? ratingInt : undefined
-    // Ticket search: accept "5", "SUP-0005", "sup 5" — match on the digits only.
-    const ticketDigits = typeof query.ticket === 'string' ? query.ticket.replace(/\D/g, '') : ''
-    const ticketNumber = ticketDigits ? Number(ticketDigits) : undefined
-    // status: "open" (never resolved) | "resolved" | undefined (all).
-    const statusWhere =
-      query.status === 'open'
-        ? { resolvedAt: null }
-        : query.status === 'resolved'
-          ? { resolvedAt: { not: null } }
-          : {}
     // eligible=1: only rows an admin can turn into a testimonial.
     const eligible = query.eligible === '1' || query.eligible === 'true'
+    // An eligible row is rated MIN_TESTIMONIAL_RATING+, so a lower rating with Eligible on
+    // can't match anything — answer now rather than walk every candidate in the range.
+    if (eligible && rating !== undefined && rating < MIN_TESTIMONIAL_RATING) {
+      res.json({ items: [], nextCursor: null, limit })
+      return
+    }
+    // A rating filter walks the (rating, createdAt, id) index, written as a one-value
+    // range with the sort led by rating so Postgres can't skip it — the same trick and
+    // reason as the strips Mode filter (see /admin/strips). With Eligible on, the
+    // candidates index is the narrow walk, and Postgres already picks it.
+    const forceRatingIndex = rating !== undefined && !eligible
     const where = {
-      ...(category ? { category } : {}),
-      ...(topic ? { topic } : {}),
-      ...(rating ? { rating } : {}),
-      ...(ticketNumber ? { ticketNumber } : {}),
-      ...statusWhere,
+      ...(rating ? { rating: forceRatingIndex ? { gte: rating, lte: rating } : rating } : {}),
       ...(eligible ? eligibleFeedbackWhere : {}),
+      ...(range ? { createdAt: range } : {}),
     }
 
-    const [items, total] = await Promise.all([
-      prisma.feedback.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take,
-        select: feedbackRowSelect,
-      }),
-      prisma.feedback.count({ where }),
-    ])
+    const rows = await prisma.feedback.findMany({
+      where: { AND: [where, afterCursor(cursor)] },
+      orderBy: [...(forceRatingIndex ? [{ rating: 'desc' as const }] : []), ...newestFirst],
+      take: limit + 1,
+      select: feedbackRowSelect,
+    })
+    const { rows: items, nextCursor } = keysetPage(rows, limit)
 
-    res.json({ items: items.map(serializeAdminFeedback), total, page, limit })
+    res.json({ items: items.map(serializeAdminFeedback), nextCursor, limit })
   }),
 )
 
 /** The columns `serializeAdminFeedback` needs — shared by every route that returns feedback. */
 const feedbackRowSelect = {
   id: true,
-  ticketNumber: true,
-  category: true,
-  topic: true,
   rating: true,
   message: true,
   email: true,
@@ -717,7 +887,6 @@ const feedbackRowSelect = {
   analyticsSessionId: true,
   userAgent: true,
   createdAt: true,
-  resolvedAt: true,
   lang: true,
   sessionMode: true,
   partnerUserId: true,
@@ -729,7 +898,7 @@ const feedbackRowSelect = {
 } as const
 
 // ── POST /admin/feedback ─── enter feedback received outside the app ─────────────
-// For a rating someone sent by DM or message. It becomes an ordinary `feedback` row on
+// For a rating someone sent by DM or message. It becomes an ordinary feedback row on
 // their account — featurable like an in-app rating — but always carries who entered it
 // and where it came from (`sourceNote`), so any published quote can be traced back.
 // There is no way to enter feedback for someone without an account.
@@ -781,7 +950,6 @@ adminRouter.post(
 
     const item = await prisma.feedback.create({
       data: {
-        category: 'feedback',
         rating,
         message,
         lang,
@@ -804,33 +972,6 @@ adminRouter.post(
   }),
 )
 
-// ── PATCH /admin/feedback/:id ─── mark a message resolved / reopen it ────────────
-adminRouter.patch(
-  '/feedback/:id',
-  asyncRoute(async (req, res) => {
-    const resolved = (req.body as { resolved?: unknown } | undefined)?.resolved
-    if (typeof resolved !== 'boolean') {
-      res.status(400).json({ error: 'invalid_input' })
-      return
-    }
-    const existing = await prisma.feedback.findUnique({
-      where: { id: req.params.id },
-      select: { id: true },
-    })
-    if (!existing) {
-      res.status(404).json({ error: 'not_found' })
-      return
-    }
-    const item = await prisma.feedback.update({
-      where: { id: req.params.id },
-      data: { resolvedAt: resolved ? new Date() : null },
-      select: feedbackRowSelect,
-    })
-    logger.info('admin.feedback.resolved', { by: req.userId, feedbackId: item.id, resolved })
-    res.json({ item: serializeAdminFeedback(item) })
-  }),
-)
-
 // ── DELETE /admin/feedback/:id ─── remove a message (spam / handled) ─────────────
 adminRouter.delete(
   '/feedback/:id',
@@ -842,6 +983,93 @@ adminRouter.delete(
       return
     }
     logger.info('admin.feedback.deleted', { by: req.userId, feedbackId: req.params.id })
+    res.json({ ok: true })
+  }),
+)
+
+// ── GET /admin/support ─── help-request inbox: every open ticket ─────────────────────
+// The inbox lists all open tickets, newest first, however old — no time range: an
+// unanswered ticket is work to do, and age shouldn't hide it. Resolving one takes it off
+// the list. A ticket # search is the exception: it finds that ticket whatever its status
+// (resolved ones last 3 days, see lib/supportRetention.ts), so it can be reopened.
+adminRouter.get(
+  '/support',
+  listRoute(async (query, res) => {
+    // Ticket search: accept "5", "SUP-0005", "sup 5" — match on the digits only.
+    const ticketDigits = typeof query.ticket === 'string' ? query.ticket.replace(/\D/g, '') : ''
+    const ticketNumber = ticketDigits ? Number(ticketDigits) : undefined
+    const { limit, cursor } = parseListQuery(query, { unbounded: true })
+    const topic = typeof query.topic === 'string' && query.topic ? query.topic : undefined
+    const where = {
+      ...(topic ? { topic } : {}),
+      ...(ticketNumber ? { ticketNumber } : { resolvedAt: null }),
+    }
+
+    const rows = await prisma.supportTicket.findMany({
+      where: { AND: [where, afterCursor(cursor)] },
+      orderBy: newestFirst,
+      take: limit + 1,
+      select: supportRowSelect,
+    })
+    const { rows: items, nextCursor } = keysetPage(rows, limit)
+
+    res.json({ items: items.map(serializeAdminSupportTicket), nextCursor, limit })
+  }),
+)
+
+/** The columns `serializeAdminSupportTicket` needs. */
+const supportRowSelect = {
+  id: true,
+  ticketNumber: true,
+  topic: true,
+  message: true,
+  email: true,
+  context: true,
+  analyticsSessionId: true,
+  userAgent: true,
+  lang: true,
+  createdAt: true,
+  resolvedAt: true,
+  user: { select: userSummarySelect },
+} as const
+
+// ── PATCH /admin/support/:id ─── mark a ticket resolved / reopen it ─────────────
+adminRouter.patch(
+  '/support/:id',
+  asyncRoute(async (req, res) => {
+    const resolved = (req.body as { resolved?: unknown } | undefined)?.resolved
+    if (typeof resolved !== 'boolean') {
+      res.status(400).json({ error: 'invalid_input' })
+      return
+    }
+    // updateMany so a missing id is a clean 404, not a P2025 throw.
+    const { count } = await prisma.supportTicket.updateMany({
+      where: { id: req.params.id },
+      data: { resolvedAt: resolved ? new Date() : null },
+    })
+    if (count === 0) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+    const item = await prisma.supportTicket.findUniqueOrThrow({
+      where: { id: req.params.id },
+      select: supportRowSelect,
+    })
+    logger.info('admin.support.resolved', { by: req.userId, ticketId: item.id, resolved })
+    res.json({ item: serializeAdminSupportTicket(item) })
+  }),
+)
+
+// ── DELETE /admin/support/:id ─── remove a ticket (spam) ────────────────────────
+adminRouter.delete(
+  '/support/:id',
+  asyncRoute(async (req, res) => {
+    const { count } = await prisma.supportTicket.deleteMany({ where: { id: req.params.id } })
+    if (count === 0) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+    logger.info('admin.support.deleted', { by: req.userId, ticketId: req.params.id })
     res.json({ ok: true })
   }),
 )
@@ -859,7 +1087,6 @@ const testimonialRowSelect = {
   quoteId: true,
   feature: true,
   rating: true,
-  position: true,
   publishedAt: true,
   showPartner: true,
   partnerUserId: true,
@@ -876,19 +1103,31 @@ function readQuote(value: unknown): string | null {
   return quote.length > 0 && quote.length <= MAX_TESTIMONIAL_QUOTE ? quote : null
 }
 
-// ── GET /admin/testimonials ─── every testimonial, drafts included, in display order ──
+// ── GET /admin/testimonials ─── testimonials, drafts included, newest first ─────────
+// Keyset-paged like the other lists, with no time range (it's a curated list, not a
+// feed). The published count — what the cap and the "hidden below N" banner need —
+// comes with the first batch only.
 adminRouter.get(
   '/testimonials',
-  asyncRoute(async (_req, res) => {
-    const items = await prisma.testimonial.findMany({
-      orderBy: [{ position: 'asc' }, { createdAt: 'asc' }],
-      select: testimonialRowSelect,
-    })
+  listRoute(async (query, res) => {
+    const { limit, cursor } = parseListQuery(query, { unbounded: true })
+    const [rows, published] = await Promise.all([
+      prisma.testimonial.findMany({
+        where: afterCursor(cursor),
+        orderBy: newestFirst,
+        take: limit + 1,
+        select: testimonialRowSelect,
+      }),
+      cursor ? null : prisma.testimonial.count({ where: { publishedAt: { not: null } } }),
+    ])
+    const { rows: items, nextCursor } = keysetPage(rows, limit)
     res.json({
       items: items.map(serializeAdminTestimonial),
-      published: items.filter((t) => t.publishedAt !== null).length,
-      maxPublished: MAX_PUBLISHED_TESTIMONIALS,
-      minShown: MIN_TESTIMONIALS_SHOWN,
+      nextCursor,
+      limit,
+      ...(published !== null
+        ? { published, maxPublished: MAX_PUBLISHED_TESTIMONIALS, minShown: MIN_TESTIMONIALS_SHOWN }
+        : {}),
     })
   }),
 )
@@ -924,9 +1163,6 @@ adminRouter.post(
       return
     }
 
-    // New drafts go to the end; the admin orders them from there.
-    const last = await prisma.testimonial.aggregate({ _max: { position: true } })
-
     let item
     try {
       item = await prisma.testimonial.create({
@@ -940,7 +1176,6 @@ adminRouter.post(
           quoteId,
           feature,
           rating: feedback.rating,
-          position: (last._max.position ?? -1) + 1,
         },
         select: testimonialRowSelect,
       })
@@ -960,41 +1195,6 @@ adminRouter.post(
     })
     markTestimonialsChanged()
     res.status(201).json({ item: serializeAdminTestimonial(item) })
-  }),
-)
-
-// ── PUT /admin/testimonials/order ─── set the display order in one go ───────────────
-// Takes every testimonial id in the new order. Positions are rewritten 0..n-1 in one
-// transaction, so "move up" can't leave two rows sharing a position halfway through. A
-// list that doesn't match the current set (someone else added or deleted one) is refused;
-// the console reloads and tries again.
-adminRouter.put(
-  '/testimonials/order',
-  asyncRoute(async (req, res) => {
-    const ids = (req.body as { ids?: unknown } | undefined)?.ids
-    if (!Array.isArray(ids) || !ids.every((id) => typeof id === 'string')) {
-      res.status(400).json({ error: 'invalid_input' })
-      return
-    }
-    const existing = await prisma.testimonial.findMany({ select: { id: true } })
-    const known = new Set(existing.map((t) => t.id))
-    if (
-      new Set(ids).size !== ids.length ||
-      ids.length !== known.size ||
-      !ids.every((id) => known.has(id))
-    ) {
-      res.status(409).json({ error: 'order_out_of_date' })
-      return
-    }
-
-    await prisma.$transaction(
-      (ids as string[]).map((id, position) =>
-        prisma.testimonial.update({ where: { id }, data: { position } }),
-      ),
-    )
-    logger.info('admin.testimonial.reordered', { by: req.userId, count: ids.length })
-    markTestimonialsChanged()
-    res.status(204).end()
   }),
 )
 
@@ -1094,44 +1294,47 @@ adminRouter.delete(
 // ── GET /admin/strips ─── strips table (metadata only, never bytes) ─────────────
 adminRouter.get(
   '/strips',
-  asyncRoute(async (req, res) => {
-    const query = req.query as Record<string, unknown>
-    const { page, limit, skip, take } = parsePagination(query)
+  listRoute(async (query, res) => {
+    const { limit, cursor, range } = parseListQuery(query)
     const paid = query.paid === 'true' ? true : query.paid === 'false' ? false : undefined
     const mode =
       typeof query.sessionMode === 'string' && query.sessionMode ? query.sessionMode : undefined
-    // `removed=true` → only strips taken out of a gallery; `false` → only live ones.
-    const removed = query.removed === 'true' ? true : query.removed === 'false' ? false : undefined
+    // A mode filter walks the (sessionMode, createdAt, id) index, so a page reads only
+    // strips of that mode. Postgres won't pick it on its own: it guesses modes are spread
+    // evenly over time, so it walks every recent strip by createdAt and drops the other
+    // modes — and when one mode is rare lately, that's the whole range for one page. The
+    // fix is in the query's shape: the mode is a one-value range rather than `=` (Postgres
+    // drops a sort key fixed by `=`, but not one bounded by a range), and the sort leads
+    // with it. Same rows and order; only that index can produce it without a sort.
+    // With paid=true the paid index is the narrow walk, and Postgres already picks it.
+    const forceModeIndex = mode !== undefined && paid !== true
     const where = {
       ...(paid !== undefined ? { paid } : {}),
-      ...(mode ? { sessionMode: mode } : {}),
-      ...(removed !== undefined ? { removedAt: removed ? { not: null } : null } : {}),
+      ...(mode ? { sessionMode: forceModeIndex ? { gte: mode, lte: mode } : mode } : {}),
+      ...(range ? { createdAt: range } : {}),
     }
 
-    const [items, total] = await Promise.all([
-      prisma.strip.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take,
-        select: {
-          id: true,
-          storageKey: true,
-          thumbnailKey: true,
-          width: true,
-          height: true,
-          sessionId: true,
-          sessionMode: true,
-          paid: true,
-          paidAt: true,
-          removedAt: true,
-          createdAt: true,
-          user: { select: userSummarySelect },
-        },
-      }),
-      prisma.strip.count({ where }),
-    ])
+    const rows = await prisma.strip.findMany({
+      where: { AND: [where, afterCursor(cursor)] },
+      orderBy: [...(forceModeIndex ? [{ sessionMode: 'desc' as const }] : []), ...newestFirst],
+      take: limit + 1,
+      select: {
+        id: true,
+        storageKey: true,
+        thumbnailKey: true,
+        width: true,
+        height: true,
+        sessionId: true,
+        sessionMode: true,
+        paid: true,
+        paidAt: true,
+        removedAt: true,
+        createdAt: true,
+        user: { select: userSummarySelect },
+      },
+    })
+    const { rows: items, nextCursor } = keysetPage(rows, limit)
 
-    res.json({ items: items.map(serializeAdminStrip), total, page, limit })
+    res.json({ items: items.map(serializeAdminStrip), nextCursor, limit })
   }),
 )
