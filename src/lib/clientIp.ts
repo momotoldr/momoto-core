@@ -1,7 +1,8 @@
-import { isIP } from 'node:net'
+import { isIP, isIPv4, isIPv6 } from 'node:net'
 
 import type { Request } from 'express'
 
+import { expandIPv6 } from './ipPrefix.js'
 import { logger } from './logger.js'
 
 /**
@@ -40,3 +41,21 @@ export function clientIp(req: Request, header: string | null): string | undefine
 }
 
 let reported = false
+
+/**
+ * The bucket a per-address rate limit counts against: the address itself for IPv4, but
+ * the /64 prefix for IPv6.
+ *
+ * One IPv6 subscriber is routinely handed a whole /64 — 2^64 addresses — so keying on the
+ * full address would let a single machine step to a fresh address per request and never
+ * meet a limit. A /64 is what one home or one server gets, so it is the smallest unit
+ * that is still one party. Same rule as momoto-realtime's copy.
+ */
+export function rateLimitKey(ip: string | undefined): string {
+  if (!ip) return 'unknown'
+  // An IPv4 client seen through a dual-stack socket arrives as `::ffff:1.2.3.4`.
+  const v4 = ip.startsWith('::ffff:') ? ip.slice(7) : ip
+  if (isIPv4(v4)) return v4
+  if (isIPv6(ip)) return `${expandIPv6(ip).slice(0, 4).join(':')}::/64`
+  return ip
+}

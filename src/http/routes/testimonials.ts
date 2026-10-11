@@ -2,7 +2,7 @@ import { Router } from 'express'
 
 import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
-import { clientIp } from '../../lib/clientIp.js'
+import { clientIp, rateLimitKey } from '../../lib/clientIp.js'
 import { placeFor } from '../../lib/locations.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
@@ -152,7 +152,7 @@ export function sweepTestimonialsLimits(now: number = Date.now()): number {
 testimonialsRouter.get(
   '/',
   asyncRoute(async (req, res) => {
-    if (!testimonialsLimiter.allow(clientIp(req, env.clientIpHeader) ?? 'unknown')) {
+    if (!testimonialsLimiter.allow(rateLimitKey(clientIp(req, env.clientIpHeader)))) {
       res.status(429).json({ error: 'too_many_requests' })
       return
     }
