@@ -21,7 +21,7 @@ export function ipPrefix(ip: string | undefined): string | null {
 }
 
 /** `2001:db8::1` → eight full groups, so the first three are the /48. */
-function expandIPv6(ip: string): string[] {
+export function expandIPv6(ip: string): string[] {
   const [head = '', tail = ''] = ip.split('::')
   const left = head ? head.split(':') : []
   const right = ip.includes('::') && tail ? tail.split(':') : []

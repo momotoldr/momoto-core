@@ -24,7 +24,7 @@ import {
 } from '../../auth/tokens.js'
 import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
-import { clientIp } from '../../lib/clientIp.js'
+import { clientIp, rateLimitKey } from '../../lib/clientIp.js'
 import { isValidEmail, normalizeEmail } from '../../lib/email.js'
 import { ipPrefix } from '../../lib/ipPrefix.js'
 import { parseLocation } from '../../lib/locations.js'
@@ -184,13 +184,14 @@ authRouter.post(
   '/register',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
-    if (!authLimiter.allow(ip)) return void limited(res, 'auth.register.ratelimited', ip)
+    if (!authLimiter.allow(rateLimitKey(ip)))
+      return void limited(res, 'auth.register.ratelimited', ip)
 
     // Closed beta: accounts are seeded by an operator, never self-served. Hiding the
     // frontend's /register route is not enough on its own — this endpoint is reachable
     // directly, so the door has to be shut here.
     if (env.inviteOnly) {
-      logger.info('auth.register.closed', { ip })
+      logger.info('auth.register.closed', { ipPrefix: ipPrefix(ip) })
       res.status(403).json({ error: 'registration_closed' })
       return
     }
@@ -272,7 +273,7 @@ authRouter.post(
   '/login',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
-    if (!authLimiter.allow(ip)) return void limited(res, 'auth.login.ratelimited', ip)
+    if (!authLimiter.allow(rateLimitKey(ip))) return void limited(res, 'auth.login.ratelimited', ip)
 
     const username = String(req.body?.username ?? '')
       .trim()
@@ -283,7 +284,7 @@ authRouter.post(
     // count). Answer 429 rather than 401 so a legitimate user learns to wait instead
     // of retyping a password that would have worked.
     if (!loginFailureLimiter.peek(username)) {
-      logger.warn('auth.login.account_locked', { ip })
+      logger.warn('auth.login.account_locked', { ipPrefix: ipPrefix(ip) })
       res.status(429).json({ error: 'too_many_requests' })
       return
     }
@@ -313,7 +314,8 @@ authRouter.post(
   '/google',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
-    if (!authLimiter.allow(ip)) return void limited(res, 'auth.google.ratelimited', ip)
+    if (!authLimiter.allow(rateLimitKey(ip)))
+      return void limited(res, 'auth.google.ratelimited', ip)
 
     const idToken = String(req.body?.idToken ?? '')
     if (!idToken) {
@@ -342,7 +344,7 @@ authRouter.post(
       // Without this, `/auth/register` being shut means nothing: this route is the other
       // way to mint an account, and it is just as reachable from outside the browser.
       if (!byEmail && env.inviteOnly) {
-        logger.info('auth.google.closed', { ip })
+        logger.info('auth.google.closed', { ipPrefix: ipPrefix(ip) })
         res.status(403).json({ error: 'registration_closed' })
         return
       }
@@ -386,7 +388,8 @@ authRouter.post(
   '/refresh',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
-    if (!refreshLimiter.allow(ip)) return void limited(res, 'auth.refresh.ratelimited', ip)
+    if (!refreshLimiter.allow(rateLimitKey(ip)))
+      return void limited(res, 'auth.refresh.ratelimited', ip)
 
     const raw = req.cookies?.[REFRESH_COOKIE]
     if (typeof raw !== 'string' || !raw) {
@@ -509,7 +512,8 @@ authRouter.post(
   '/verify-email',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
-    if (!resetTokenLimiter.allow(ip)) return void limited(res, 'auth.verify_email.ratelimited', ip)
+    if (!resetTokenLimiter.allow(rateLimitKey(ip)))
+      return void limited(res, 'auth.verify_email.ratelimited', ip)
 
     const token = String(req.body?.token ?? '')
     if (!token) {
@@ -619,7 +623,8 @@ authRouter.post(
   '/forgot-password',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
-    if (!forgotIpLimiter.allow(ip)) return void limited(res, 'auth.forgot.ratelimited', ip)
+    if (!forgotIpLimiter.allow(rateLimitKey(ip)))
+      return void limited(res, 'auth.forgot.ratelimited', ip)
 
     const identifier = String(req.body?.identifier ?? '')
       .trim()
@@ -638,7 +643,7 @@ authRouter.post(
         const sent = await issuePasswordReset(user, lang)
         if (!sent) logger.info('auth.forgot.no_verified_email', { userId: user.id })
       } else {
-        logger.info('auth.forgot.unknown_identifier', { ip })
+        logger.info('auth.forgot.unknown_identifier', { ipPrefix: ipPrefix(ip) })
       }
     }
 
@@ -654,7 +659,8 @@ authRouter.get(
   '/reset-password',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
-    if (!resetTokenLimiter.allow(ip)) return void limited(res, 'auth.reset.ratelimited', ip)
+    if (!resetTokenLimiter.allow(rateLimitKey(ip)))
+      return void limited(res, 'auth.reset.ratelimited', ip)
 
     const token = typeof req.query.token === 'string' ? req.query.token : ''
     res.json({ valid: token ? await isResetTokenValid(token) : false })
@@ -666,7 +672,8 @@ authRouter.post(
   '/reset-password',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
-    if (!resetTokenLimiter.allow(ip)) return void limited(res, 'auth.reset.ratelimited', ip)
+    if (!resetTokenLimiter.allow(rateLimitKey(ip)))
+      return void limited(res, 'auth.reset.ratelimited', ip)
 
     const token = String(req.body?.token ?? '')
     const password = String(req.body?.password ?? '')
@@ -898,10 +905,11 @@ authRouter.delete(
 // Self-service account deletion. For an account that has a password, we re-verify
 // it here: an access token alone (which could be lingering on a shared device)
 // shouldn't be enough to erase an account. Google-only accounts have no password to
-// check — the valid session is the proof. The delete cascades the user's strip rows,
-// refresh tokens and partner invites, unlinks any partner, and detaches feedback (kept
-// for triage); their payment records are removed with the account. The strips' images
-// and the avatar live in object storage, which doesn't cascade — they're deleted after.
+// check — the valid session is the proof. Payments don't block it. The delete cascades
+// the user's strip rows, refresh tokens and partner invites, unlinks any partner, and
+// detaches feedback (kept for triage) and payments (the record of money received — there
+// are no refunds). The strips' images and the avatar live in object storage, which
+// doesn't cascade — they're deleted after.
 authRouter.delete(
   '/me',
   requireAuth,

@@ -37,6 +37,9 @@ import { DeleteObjectsCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/c
 
 import { prisma } from '../src/db/client.js'
 
+/** Rows per DELETE — see the comment where it's used. */
+const PURGE_BATCH = 500
+
 interface Options {
   confirm: boolean
   username: string | null
@@ -239,9 +242,14 @@ async function main(): Promise<void> {
   // simply be repeated. The reverse order would lose the only reference and strand them.
   await deleteKeys(client, publicBucket, publicKeys)
   await deleteKeys(client, privateBucket, privateKeys)
-  const { count } = await prisma.strip.deleteMany({
-    where: { id: { in: strips.map((s) => s.id) } },
-  })
+  // In batches: every deleted strip bumps the same few counter rows (`DailyStat` /
+  // `MetricTotal`, via triggers), and Postgres can't clean up a row's old versions until
+  // the statement that made them ends — so one huge DELETE slows down quadratically.
+  let count = 0
+  for (let i = 0; i < strips.length; i += PURGE_BATCH) {
+    const batch = strips.slice(i, i + PURGE_BATCH).map((s) => s.id)
+    count += (await prisma.strip.deleteMany({ where: { id: { in: batch } } })).count
+  }
   console.log(`\nDeleted ${count} row(s) and ${publicKeys.length + privateKeys.length} object(s).`)
   console.log(`${mb(bytes)} freed.`)
 }

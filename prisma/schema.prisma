@@ -96,10 +96,20 @@ model User {
   strips             Strip[]
   payments           Payment[]
   feedbacks          Feedback[]               @relation("FeedbackAuthor")
+  supportTickets     SupportTicket[]          @relation("SupportTicketAuthor")
   partnerFeedbacks   Feedback[]               @relation("FeedbackPartner")
   testimonials       Testimonial[]            @relation("TestimonialAuthor")
   featuredWith       Testimonial[]            @relation("TestimonialPartner")
   enteredFeedbacks   Feedback[]               @relation("FeedbackEnteredBy")
+
+  /// Keyset order for the admin users table (newest first, id breaks ties).
+  @@index([createdAt, id])
+  /// Trigram indexes for the admin user search (`ILIKE '%q%'`), so finding one account
+  /// is an index lookup instead of a full scan. Needs the pg_trgm extension (created in
+  /// migration 20261010010000) and a search of 3+ characters — see admin `/users`.
+  @@index([username(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([displayName(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([email(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 /// A feedback or support message from the app: the floating feedback button, or the
@@ -109,46 +119,43 @@ model User {
 /// null (rather than cascading) if the account is later deleted, so the message is
 /// kept for triage. `category` is free-form ("feedback" | "support") to avoid an
 /// enum migration if the set changes.
+/// A rating or comment about the product — the star rating beside a finished strip, or
+/// one an admin entered from elsewhere — and the source of landing-page testimonials.
+/// Help requests are `SupportTicket`s, not feedback.
 model Feedback {
-  id                 String    @id @default(cuid())
-  /// Short, human-referenceable ticket number (auto-incrementing). Assigned to every
-  /// row, but only surfaced in the admin console for support requests, where an
-  /// operator needs something short to quote back to the user.
-  ticketNumber       Int       @unique @default(autoincrement())
-  userId             String?
-  user               User?     @relation("FeedbackAuthor", fields: [userId], references: [id], onDelete: SetNull)
-  category           String
-  /// What a support request is about ('session' | 'strip' | 'payment' | 'account' |
-  /// 'other'), picked before the message is written. Null for ratings, admin-entered
-  /// feedback, and support requests sent before topics existed.
-  topic              String?
+  id                   String   @id @default(cuid())
+  userId               String?
+  user                 User?    @relation("FeedbackAuthor", fields: [userId], references: [id], onDelete: SetNull)
   /// Optional 1–5 satisfaction rating.
-  rating             Int?
+  rating               Int?
+  /// Could become a testimonial: a signed-in author, a written comment, 4+ stars — the
+  /// row-level half of `isEligibleFeedback` (lib/testimonials.ts; "not featured yet" is
+  /// the other half). **Set by the `feedback_testimonial_candidate` trigger, never by app
+  /// code** (migration 20261010110000), so it stays exact as author/comment/rating change.
+  /// Indexed so the inbox's Eligible filter reads candidates only.
+  testimonialCandidate Boolean  @default(false)
   /// Empty string when the row is a rating on its own (the star rating beside a
   /// finished strip is one tap, with no comment attached).
-  message            String
+  message              String
   /// Optional reply-to address (prefilled from the account when signed in).
-  email              String?
+  email                String?
   /// Where it was sent from (a page path) — a client-supplied triage hint.
-  context            String?
+  context              String?
   /// The sender's analytics visit (momoto-tracker `sessionId`, a UUID): the key to their
   /// event timeline in momoto-analytics. Null when tracking was off for that visit.
-  analyticsSessionId String?
-  userAgent          String?
-  createdAt          DateTime  @default(now())
-  /// When an admin marked this message handled (null = still open). Set from the
-  /// admin console; the acting admin is recorded in the server log, not here.
-  resolvedAt         DateTime?
+  analyticsSessionId   String?
+  userAgent            String?
+  createdAt            DateTime @default(now())
   /// UI language when it was sent ('en' | 'id') — a testimonial's original language.
-  lang               String?
+  lang                 String?
   /// Session mode of the strip being rated ('solo' | 'date' | 'group'). A hint for an
   /// admin choosing a testimonial's feature tag, not a guarantee.
-  sessionMode        String?
+  sessionMode          String?
   /// The partner the author was linked to when they sent this, read by the server from
   /// the link (never sent by the client). A couple testimonial shows this person, and
   /// only while the author is still linked to them.
-  partnerUserId      String?
-  partner            User?     @relation("FeedbackPartner", fields: [partnerUserId], references: [id], onDelete: SetNull)
+  partnerUserId        String?
+  partner              User?    @relation("FeedbackPartner", fields: [partnerUserId], references: [id], onDelete: SetNull)
 
   /// The testimonial an admin built from this row, if any.
   testimonial Testimonial?
@@ -162,7 +169,58 @@ model Feedback {
   enteredById String?
   enteredBy   User?   @relation("FeedbackEnteredBy", fields: [enteredById], references: [id], onDelete: SetNull)
 
-  @@index([createdAt])
+  /// Keyset order for the admin feedback inbox (newest first, id breaks ties).
+  @@index([createdAt, id])
+  /// The Eligible filter: newest-first over candidates only.
+  @@index([testimonialCandidate, createdAt, id])
+  /// The Rating filter: newest-first within one star rating, so a rating that's rare
+  /// lately doesn't walk through every recent row of the common ones.
+  @@index([rating, createdAt, id])
+  /// The per-user feedback count on the admin users table, and account deletion.
+  @@index([userId])
+  /// Deleting a user nulls these references; without an index each deletion scans the
+  /// whole table (measured: ~90 ms at 1M rows for the two together).
+  @@index([partnerUserId])
+  @@index([enteredById])
+}
+
+/// A help request from the app's support button. Separate from `Feedback` (until
+/// 2026-10-10 both were rows of one table, told apart by `category`): its own ticket
+/// numbering, topic, status and reply address.
+model SupportTicket {
+  id                 String    @id @default(cuid())
+  /// Short, human-referenceable number (SUP-0005) an operator quotes back to the user.
+  /// Tickets moved over from `Feedback` kept theirs; new ones continue after the highest.
+  ticketNumber       Int       @unique @default(autoincrement())
+  userId             String?
+  user               User?     @relation("SupportTicketAuthor", fields: [userId], references: [id], onDelete: SetNull)
+  /// What it's about ('session' | 'strip' | 'payment' | 'account' | 'other'), picked
+  /// before the message is written. Null for requests sent before topics existed.
+  topic              String?
+  message            String
+  /// Reply-to address (prefilled from the account when signed in).
+  email              String?
+  /// Where it was sent from (a page path) — a client-supplied triage hint.
+  context            String?
+  /// The sender's analytics visit (momoto-tracker `sessionId`, a UUID): the key to their
+  /// event timeline in momoto-analytics. Null when tracking was off for that visit.
+  analyticsSessionId String?
+  userAgent          String?
+  /// UI language when it was sent ('en' | 'id'), so a reply can match it.
+  lang               String?
+  createdAt          DateTime  @default(now())
+  /// When an admin marked it handled (null = still open). The acting admin is recorded
+  /// in the server log, not here. 3 days after this the ticket is deleted
+  /// (lib/supportRetention.ts); open tickets are kept however old.
+  resolvedAt         DateTime?
+
+  /// Keyset order for the admin support inbox (newest first, id breaks ties).
+  @@index([createdAt, id])
+  /// The inbox's Open filter: reads only open tickets (resolvedAt IS NULL), whatever the
+  /// ticket volume — otherwise a rare open + topic mix walks the whole time range.
+  @@index([resolvedAt, createdAt, id])
+  /// A user's tickets: the admin users table count, user detail, account deletion.
+  @@index([userId])
 }
 
 /// A rating comment an admin has picked for the landing page's "What people say" section,
@@ -198,14 +256,18 @@ model Testimonial {
   feature       String
   /// The author's stars, copied when featured and never edited.
   rating        Int
-  /// Display order, ascending.
-  position      Int       @default(0)
   /// Null = draft.
   publishedAt   DateTime?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
-  @@index([publishedAt, position])
+  /// The landing page reads published ones only.
+  @@index([publishedAt])
+  /// The admin list: newest first, keyset-paged (id breaks ties).
+  @@index([createdAt, id])
+  /// Deleting a user cascades / nulls through these.
+  @@index([userId])
+  @@index([partnerUserId])
 }
 
 /// A photo strip the user saved to their cart.
@@ -271,6 +333,52 @@ model Strip {
 
   @@unique([userId, clientKey])
   @@index([userId, createdAt])
+  /// Keyset order for the admin strips table, and the time range on admin sessions.
+  @@index([createdAt, id])
+  /// The strips table's Paid / Free filter: newest-first within one side. New strips are
+  /// mostly unpaid (saved first, unlocked later), so without this "Paid" walks through
+  /// every recent unpaid strip to fill a page.
+  @@index([paid, createdAt, id])
+  /// The strips table's Mode filter: newest-first within one session mode, so a mode
+  /// that's quiet lately doesn't walk through every recent strip of the busy ones.
+  @@index([sessionMode, createdAt, id])
+  /// A session's strips by session id: the admin Sessions participants lookup, and the
+  /// `Session` trigger's first/last recompute when a strip leaves a session.
+  @@index([sessionId, createdAt])
+}
+
+/// One photo session (a room code) with at least one saved strip — a summary of its
+/// strips, so listing and counting sessions never has to group the Strip table.
+///
+/// **Kept by a database trigger, never written by app code**: `strip_session_sync` on
+/// "Strip" (migration 20261010030000_session_table) adds to it on every strip insert and
+/// subtracts on every delete, cascades included, and drops the row with its last strip.
+/// The FE's no-room placeholder sessionId "solo" is not a session and is skipped.
+model Session {
+  /// The strips' `sessionId` — a room code.
+  id         String   @id
+  /// The room's mode ("solo" | "date" | "group"), from its first strip that had one.
+  mode       String?
+  stripCount Int
+  firstAt    DateTime
+  lastAt     DateTime
+
+  /// Admin Sessions: newest-first keyset on the last strip, id breaks ties.
+  @@index([lastAt, id])
+  /// The same, filtered to one mode — and the per-mode session counts.
+  @@index([mode, lastAt, id])
+}
+
+/// Who took part in a session: one row per (session, person) with how many strips they
+/// saved in it — so the admin Sessions page reads one row per participant, not one per
+/// strip. **Kept by the `strip_session_sync` trigger** like `Session` (migration
+/// 20261010130000), never by app code; the row goes with the person's last strip there.
+model SessionMember {
+  sessionId  String
+  userId     String
+  stripCount Int
+
+  @@id([sessionId, userId])
 }
 
 /// The clean, watermark-free copy of a strip — the paid deliverable. Kept in a side
@@ -301,9 +409,12 @@ model Payment {
   id             String    @id @default(cuid())
   /// Our Midtrans `order_id` (unique per attempt).
   orderId        String    @unique
-  userId         String
-  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Null once the payer deleted their account: the payment stays as the record of money
+  /// received (there are no refunds), detached rather than deleted with them.
+  userId         String?
+  user           User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
   /// The strips this checkout unlocks (implicit m-n) — all flipped paid on settlement.
+  /// Empty once the payer's account is deleted (their strips go with it).
   strips         Strip[]
   grossAmount    Int
   currency       String    @default("IDR")
@@ -325,6 +436,15 @@ model Payment {
   paidAt         DateTime?
 
   @@index([userId])
+  /// Keyset order for the admin transactions table (newest first, id breaks ties).
+  @@index([createdAt, id])
+  /// The transactions table filtered by status: newest-first within one status, so a
+  /// rare status (cancelled, expired) reads only its own rows instead of walking every
+  /// payment in the range. Cheap to keep — payments are written rarely.
+  @@index([status, createdAt, id])
+  /// Admin Transactions revenue: the live sum for a range's partial first/last day
+  /// (whole days come off the `revenue` DailyStat counter).
+  @@index([paidAt])
 }
 
 /// **Legacy** storage for an uploaded profile picture, as bytes in Postgres.
@@ -361,6 +481,10 @@ model RefreshToken {
   createdAt DateTime  @default(now())
 
   @@index([userId])
+  /// The 30-second sweep (`sweepRefreshTokens`) deletes by expiry or by revocation age;
+  /// one index per side of its OR, so it reads only the rows it deletes.
+  @@index([expiresAt])
+  @@index([revokedAt])
 }
 
 /// A short-lived, single-use code one user shares to link a partner account.
@@ -373,6 +497,10 @@ model PartnerInvite {
   createdAt DateTime  @default(now())
 
   @@index([inviterId])
+  /// The 30-second sweep (`sweepPartnerInvites`) deletes expired or used rows; one index per side
+  /// of its OR, so it reads only the rows it deletes.
+  @@index([expiresAt])
+  @@index([usedAt])
 }
 
 /// A claim on an email address, pending proof.
@@ -403,6 +531,10 @@ model EmailVerificationToken {
   createdAt DateTime  @default(now())
 
   @@index([userId])
+  /// The 30-second sweep (`sweepEmailVerificationTokens`) deletes expired or used rows; one index per side
+  /// of its OR, so it reads only the rows it deletes.
+  @@index([expiresAt])
+  @@index([usedAt])
 }
 
 /// A single-use password-reset credential, hashed. The raw token exists only in the
@@ -421,4 +553,43 @@ model PasswordResetToken {
   createdAt DateTime  @default(now())
 
   @@index([userId])
+  /// The 30-second sweep (`sweepPasswordResetTokens`) deletes expired or used rows; one index per side
+  /// of its OR, so it reads only the rows it deletes.
+  @@index([expiresAt])
+  @@index([usedAt])
+}
+
+/// Daily counters behind the admin Overview and the public `/stats` totals: one row per
+/// (metric, UTC day). "Last 7 days" is the sum from a start day, a trend the days
+/// themselves; all-time totals live in `MetricTotal` — so neither endpoint ever counts
+/// a big table, and none of it grows with traffic.
+///
+/// **Kept by database triggers, never written by app code** (migrations
+/// 20261010040000_daily_stats, 20261010070000_support_tickets): every insert, delete
+/// and relevant update on User, Strip, Feedback, SupportTicket, Payment and Session adds
+/// or takes back its contribution. Metrics:
+///
+/// - `users` — accounts, by signup day
+/// - `strips`, `strips:<mode>` — strips, by creation day; mode null → `strips:unknown`
+/// - `feedback`, `rating:<1-5>` — feedback rows (ratings/comments), by creation day
+/// - `support`, `support:open` — support tickets, all and still-open, by creation day
+/// - `revenue`, `paid_orders` — paid payments' gross amount and count, by `paidAt` day
+///   (creation day if a paid row has no `paidAt`)
+/// - `sessions:<mode>` — Session rows, by their first strip's day
+model DailyStat {
+  metric String
+  day    DateTime @db.Date
+  value  BigInt
+
+  @@id([metric, day])
+  /// The Overview's last-7/30-day sums read recent days across all metrics.
+  @@index([day])
+}
+
+/// All-time totals of the `DailyStat` metrics, one row per metric — so a total reads
+/// one row instead of summing every day the app has existed. Kept by the same
+/// `daily_stat_bump` function (migration 20261010120000), never by app code.
+model MetricTotal {
+  metric String @id
+  value  BigInt
 }
