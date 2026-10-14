@@ -36,9 +36,15 @@ import { normalizeLang } from '../../notifications/lang.js'
 import {
   avatarKey as newAvatarKey,
   deleteImages,
+  incomingKey,
+  presignedPutUrl,
+  promoteObject,
   putImage,
+  readObject,
   storageEnabled,
+  UPLOAD_BUCKET,
 } from '../../storage/objectStore.js'
+import { signUploadGrant, verifyUploadGrant } from '../../storage/uploadGrant.js'
 import { asyncRoute } from '../asyncRoute.js'
 import { readImageSize, sniffImageType } from '../imageType.js'
 import { requireAuth } from '../middleware/requireAuth.js'
@@ -127,6 +133,9 @@ const AVATAR_MAX_EDGE = 1024
 /** Uploads are the one write here that stores real bytes — keep the rate modest. */
 const avatarLimiter = new RateLimiter(20, 10 * 60_000)
 
+/** The formats an avatar may be uploaded in, by either path. */
+const AVATAR_MIME_TYPES = ['image/webp', 'image/jpeg', 'image/png'] as const
+
 /**
  * Accept the image as a raw body rather than multipart.
  *
@@ -135,7 +144,7 @@ const avatarLimiter = new RateLimiter(20, 10 * 60_000)
  * body parsers don't collide.
  */
 const avatarBody = express.raw({
-  type: ['image/webp', 'image/jpeg', 'image/png'],
+  type: [...AVATAR_MIME_TYPES],
   limit: AVATAR_MAX_BYTES,
 })
 
@@ -744,7 +753,88 @@ authRouter.patch(
   }),
 )
 
+// ── Avatars: the checks both upload paths share ──────────────────────────────
+
+/**
+ * Whether these bytes are a usable avatar, trusting the bytes rather than any header.
+ *
+ * An avatar is square, and that is enforced here rather than only in the browser. Our own
+ * client center-crops to a 256px square before it uploads, so nothing in the app can trip
+ * these — but these are plain HTTP endpoints, and a request that skips the client entirely
+ * is one `curl` away. Without the check, a 4000×100 banner would be stored and then
+ * rendered into the partner's profile and the admin console, both of which lay avatars
+ * out as squares.
+ *
+ * Two separate lookups: `sniffImageType` decides *whether these bytes are an image we
+ * serve*, `readImageSize` *whether the image is a usable avatar*.
+ */
+async function validateAvatar(
+  bytes: Buffer,
+): Promise<{ mimeType: string; edge: number } | { status: number; error: string }> {
+  const mimeType = sniffImageType(bytes)
+  if (!mimeType) return { status: 400, error: 'unsupported_image' }
+  const size = await readImageSize(bytes)
+  if (!size) return { status: 400, error: 'unsupported_image' }
+  if (size.width !== size.height) return { status: 400, error: 'image_not_square' }
+  if (size.width > AVATAR_MAX_EDGE) return { status: 400, error: 'image_too_large' }
+  return { mimeType, edge: size.width }
+}
+
+/**
+ * Point the user at an avatar object that is already at its permanent key, and drop the
+ * one it replaces.
+ *
+ * Clearing the legacy row is part of the same transaction: a user must never hold both,
+ * or the two paths in `GET /avatars/:userId` would disagree about which picture is
+ * current.
+ */
+async function commitAvatarKey(userId: string, key: string) {
+  // What the picture is replacing, read before anything overwrites it: the old object
+  // has to be cleaned up by hand, since nothing else names it once the column moves on.
+  const previous = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { avatarKey: true },
+  })
+  const [, user] = await prisma.$transaction([
+    prisma.avatarImage.deleteMany({ where: { userId } }),
+    prisma.user.update({
+      where: { id: userId },
+      data: { avatarKey: key, avatarUpdatedAt: new Date() },
+      include: { partner: true },
+    }),
+  ])
+  // Best-effort, and only after the row is committed: a leftover object costs storage,
+  // while deleting one the row still points at costs the user their picture.
+  if (previous?.avatarKey) await deleteImages('avatar', [previous.avatarKey])
+  return user
+}
+
+/**
+ * Log a refused bucket write and answer 503.
+ *
+ * A refused write is an operational fault, not a bad request, and it must not surface
+ * as a bare `internal_error` — that reads as "the app is broken" when the real answer is
+ * usually one bucket setting. 503, because the request was fine and the rest of the API
+ * still works; the log names the bucket so the cause is in the line you already have
+ * rather than in a stack trace.
+ */
+function avatarStorageFailed(res: Response, userId: string, error: unknown): void {
+  logger.error('auth.avatar.storageFailed', {
+    userId,
+    bucket: 'avatar',
+    message: (error as Error).message,
+    hint: 'Check R2_AVATAR_BUCKET exists and the R2 API token is scoped to it.',
+  })
+  res.status(503).json({ error: 'storage_unavailable' })
+}
+
 // ── POST /auth/me/avatar ─── replace the profile picture ─────────────────────
+/**
+ * The picture in the request body, stored by this server. Current clients upload
+ * straight to the bucket instead (`/me/avatar/uploads`, below) and come here when that
+ * fails — and always when no bucket is configured, since this is the only path that can
+ * fall back to Postgres.
+ */
 authRouter.post(
   '/me/avatar',
   requireAuth,
@@ -761,46 +851,12 @@ authRouter.post(
       res.status(400).json({ error: 'invalid_input' })
       return
     }
-    // Trust the bytes, not the header the client sent with them.
-    const mimeType = sniffImageType(bytes)
-    if (!mimeType) {
-      res.status(400).json({ error: 'unsupported_image' })
+    const avatar = await validateAvatar(bytes)
+    if ('error' in avatar) {
+      res.status(avatar.status).json({ error: avatar.error })
       return
     }
-
-    /**
-     * An avatar is square, and that is enforced here rather than only in the browser.
-     *
-     * Our own client center-crops to a 256px square before it uploads, so nothing in
-     * the app can trip these — but this is a plain HTTP endpoint, and a request that
-     * skips the client entirely is one `curl` away. Without the check, a 4000×100
-     * banner would be stored and then rendered into the partner's profile and the
-     * admin console, both of which lay avatars out as squares.
-     *
-     * A separate lookup from `sniffImageType`: that one decides *whether these bytes
-     * are an image we serve*, this one decides *whether the image is a usable avatar*.
-     */
-    const size = await readImageSize(bytes)
-    if (!size) {
-      res.status(400).json({ error: 'unsupported_image' })
-      return
-    }
-    if (size.width !== size.height) {
-      res.status(400).json({ error: 'image_not_square' })
-      return
-    }
-    if (size.width > AVATAR_MAX_EDGE) {
-      res.status(400).json({ error: 'image_too_large' })
-      return
-    }
-
-    // What the picture is replacing, read before anything overwrites it: the old
-    // object has to be cleaned up by hand, since nothing else names it once the
-    // column moves on.
-    const previous = await prisma.user.findUnique({
-      where: { id: userId },
-      select: { avatarKey: true },
-    })
+    const { mimeType } = avatar
 
     let user
     if (storageEnabled) {
@@ -810,33 +866,10 @@ authRouter.post(
       try {
         await putImage('avatar', key, bytes, mimeType)
       } catch (error) {
-        // A refused write is an operational fault, not a bad request, and it must not
-        // surface as a bare `internal_error` — that reads as "the app is broken" when
-        // the real answer is usually one bucket setting. 503, because the request was
-        // fine and the rest of the API still works; the log names the bucket so the
-        // cause is in the line you already have rather than in a stack trace.
-        logger.error('auth.avatar.storageFailed', {
-          userId,
-          bucket: 'avatar',
-          message: (error as Error).message,
-          hint: 'Check R2_AVATAR_BUCKET exists and the R2 API token is scoped to it.',
-        })
-        res.status(503).json({ error: 'storage_unavailable' })
+        avatarStorageFailed(res, userId, error)
         return
       }
-
-      // Clearing the legacy row is part of the same transaction: a user must never
-      // hold both, or the two paths in `GET /avatars/:userId` would disagree about
-      // which picture is current.
-      const [, updated] = await prisma.$transaction([
-        prisma.avatarImage.deleteMany({ where: { userId } }),
-        prisma.user.update({
-          where: { id: userId },
-          data: { avatarKey: key, avatarUpdatedAt: new Date() },
-          include: { partner: true },
-        }),
-      ])
-      user = updated
+      user = await commitAvatarKey(userId, key)
     } else {
       // No bucket configured — keep the bytes in Postgres, as they were before
       // avatars moved to object storage. Small enough that this stays a workable
@@ -845,6 +878,10 @@ authRouter.post(
       // Prisma types a `Bytes` column as a plain Uint8Array; copy out of the Buffer so
       // the value doesn't carry Node's wider ArrayBufferLike backing type.
       const data = new Uint8Array(bytes)
+      const previous = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { avatarKey: true },
+      })
 
       // Write the image and flag the user in one transaction: a stamped user with no
       // row behind it would render a broken picture for them and their partner.
@@ -861,14 +898,130 @@ authRouter.post(
         }),
       ])
       user = updated
+      if (previous?.avatarKey) await deleteImages('avatar', [previous.avatarKey])
     }
 
-    // Best-effort, and only after the row is committed: a leftover object costs
-    // storage, while deleting one the row still points at costs the user their
-    // picture.
-    if (previous?.avatarKey) await deleteImages('avatar', [previous.avatarKey])
+    logger.info('auth.avatar.uploaded', {
+      userId,
+      bytes: bytes.length,
+      mimeType,
+      edge: avatar.edge,
+      direct: false,
+    })
+    res.json({ user: serializeUser(user) })
+  }),
+)
 
-    logger.info('auth.avatar.uploaded', { userId, bytes: bytes.length, mimeType, edge: size.width })
+// ── POST /auth/me/avatar/uploads ─── start a direct upload ───────────────────
+/**
+ * Start an avatar upload that goes browser → bucket directly. Body (JSON):
+ * `{ type, size }`. Answers `{ upload: { token, file: { url, contentType } } }`: a
+ * presigned PUT under `incoming/` in the private upload bucket (never the public avatar
+ * bucket — see `UPLOAD_BUCKET`), with the declared type and size
+ * signed in, and the grant that completes it.
+ *
+ * `409 direct_upload_unavailable` when no bucket is configured — the client then sends
+ * the bytes to `POST /me/avatar`, which keeps them in Postgres.
+ */
+authRouter.post(
+  '/me/avatar/uploads',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const userId = req.userId as string
+    if (!storageEnabled) {
+      res.status(409).json({ error: 'direct_upload_unavailable' })
+      return
+    }
+    if (!avatarLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
+    const { type, size } = (req.body ?? {}) as { type?: unknown; size?: unknown }
+    if (
+      typeof type !== 'string' ||
+      !(AVATAR_MIME_TYPES as readonly string[]).includes(type) ||
+      typeof size !== 'number' ||
+      !Number.isInteger(size) ||
+      size <= 0 ||
+      size > AVATAR_MAX_BYTES
+    ) {
+      res.status(400).json({ error: 'invalid_input' })
+      return
+    }
+    const key = incomingKey()
+    const url = await presignedPutUrl(UPLOAD_BUCKET, key, {
+      contentType: type,
+      contentLength: size,
+    })
+    const token = signUploadGrant({
+      kind: 'avatar',
+      userId,
+      file: { key, contentType: type, size },
+    })
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.json({ upload: { token, file: { url, contentType: type } } })
+  }),
+)
+
+// ── POST /auth/me/avatar/uploads/complete ─── validate, promote, save ────────
+/**
+ * Finish a direct avatar upload: read the object back (free ingress), run the same
+ * checks as `POST /me/avatar`, copy it across to its permanent random key in the avatar bucket,
+ * and point the user at it. Body (JSON): `{ token }`.
+ *
+ * `409 upload_incomplete` when the granted object isn't there — the PUT never finished;
+ * the client falls back to `POST /me/avatar`.
+ */
+authRouter.post(
+  '/me/avatar/uploads/complete',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const userId = req.userId as string
+    if (!storageEnabled) {
+      res.status(409).json({ error: 'direct_upload_unavailable' })
+      return
+    }
+    const grant = verifyUploadGrant(
+      (req.body as { token?: unknown } | undefined)?.token,
+      'avatar',
+      userId,
+    )
+    if (!grant) {
+      res.status(400).json({ error: 'invalid_upload' })
+      return
+    }
+    const incoming = grant.file.key
+    const bytes = await readObject(UPLOAD_BUCKET, incoming, AVATAR_MAX_BYTES)
+    if (!bytes) {
+      res.status(409).json({ error: 'upload_incomplete' })
+      return
+    }
+    const avatar = await validateAvatar(bytes)
+    if ('error' in avatar) {
+      await deleteImages(UPLOAD_BUCKET, [incoming])
+      res.status(avatar.status).json({ error: avatar.error })
+      return
+    }
+
+    // Promoted to a fresh random key, never the `incoming/` one: the key is the avatar's
+    // whole cache-buster (see `avatarKey`), and its extension follows the sniffed bytes.
+    const key = newAvatarKey(avatar.mimeType)
+    try {
+      await promoteObject(incoming, 'avatar', key, avatar.mimeType)
+    } catch (error) {
+      avatarStorageFailed(res, userId, error)
+      return
+    }
+    const user = await commitAvatarKey(userId, key)
+    await deleteImages(UPLOAD_BUCKET, [incoming])
+
+    logger.info('auth.avatar.uploaded', {
+      userId,
+      bytes: bytes.length,
+      mimeType: avatar.mimeType,
+      edge: avatar.edge,
+      direct: true,
+    })
     res.json({ user: serializeUser(user) })
   }),
 )

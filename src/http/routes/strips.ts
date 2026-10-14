@@ -1,5 +1,5 @@
 import { Prisma } from '@prisma/client'
-import express, { Router, type Response } from 'express'
+import express, { Router, type Request, type Response } from 'express'
 
 import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
@@ -8,13 +8,20 @@ import { RateLimiter } from '../../lib/rateLimiter.js'
 import {
   deleteImages,
   getImageStream,
+  incomingKey,
+  presignedGetUrl,
+  presignedPutUrl,
+  promoteObject,
   publicUrl,
   putImage,
+  readObject,
   storageEnabled,
   stripKey,
   type Bucket,
+  UPLOAD_BUCKET,
 } from '../../storage/objectStore.js'
 import { makeThumbnail, THUMBNAIL_BOUNDS, THUMBNAIL_MIME } from '../../storage/thumbnail.js'
+import { signUploadGrant, verifyUploadGrant } from '../../storage/uploadGrant.js'
 import { asyncRoute } from '../asyncRoute.js'
 import { readImageSize, sniffImageType } from '../imageType.js'
 import { requireAuth } from '../middleware/requireAuth.js'
@@ -69,7 +76,7 @@ const stripBody = express.raw({
  *     [4-byte big-endian length of the watermarked PNG][watermarked PNG][clean PNG]
  *
  * One request rather than two because a strip is only worth anything if *both* copies
- * arrive. The clean copy used to be a follow-up `POST /strips/:id/print-image` fired
+ * arrive. The clean copy used to be a follow-up `POST /strips/:id/print-image` (since removed) fired
  * after the result screen had already said "saved" — so a user who navigated away, or
  * whose second request tripped the shared rate limit, ended up with a row that both
  * unlock paths refuse forever and nothing could repair (rebuilding the clean copy needs
@@ -479,7 +486,214 @@ export async function deleteStripObjects(
   await Promise.all([deleteImages('public', publicKeys), deleteImages('private', privateKeys)])
 }
 
+// ── Saving a strip: the checks both upload paths share ───────────────────────
+//
+// A strip arrives one of two ways: as one raw body through `POST /strips` (the original
+// path, still used by older clients and as the fallback), or uploaded by the browser
+// straight to R2 and then completed through `POST /strips/uploads/complete`. Everything
+// that decides *whether* a strip is saved lives below, so the two can't disagree.
+
+/** A request refused, with the status and code to answer it with. */
+interface Refusal {
+  status: number
+  error: string
+}
+
+function isRefusal(value: object): value is Refusal {
+  return 'error' in value
+}
+
+interface ValidatedStrip {
+  watermarkedType: StripMimeType
+  dimensions: { width: number; height: number }
+  clean: { type: StripMimeType; dimensions: { width: number; height: number } } | null
+}
+
+/**
+ * Check a strip's two images, trusting the bytes rather than any header sent with them.
+ * The sniffed type is what gets stored and served, so the two copies are free to be
+ * different formats: the client sends lossy WebP for one and lossless for the other.
+ */
+async function validateStripImages(
+  watermarked: Buffer,
+  clean: Buffer | null,
+): Promise<ValidatedStrip | Refusal> {
+  const watermarkedType = sniffImageType(watermarked)
+  if (!isStripMimeType(watermarkedType)) return { status: 400, error: 'unsupported_image' }
+  // Checked in its own block rather than folded into the condition above, so the
+  // narrowed type survives to the write instead of needing a cast there.
+  let cleanType: StripMimeType | null = null
+  if (clean) {
+    const sniffed = sniffImageType(clean)
+    if (!isStripMimeType(sniffed)) return { status: 400, error: 'unsupported_image' }
+    cleanType = sniffed
+  }
+  if (watermarked.length > STRIP_MAX_BYTES) return { status: 413, error: 'image_too_large' }
+  // Header-only, so this stays cheap and can't be turned into a decompression bomb.
+  const dimensions = await readImageSize(watermarked)
+  const cleanDimensions = clean ? await readImageSize(clean) : null
+  if (!dimensions || (clean && !cleanDimensions)) return { status: 400, error: 'invalid_input' }
+  return {
+    watermarkedType,
+    dimensions,
+    clean: cleanType && cleanDimensions ? { type: cleanType, dimensions: cleanDimensions } : null,
+  }
+}
+
+/**
+ * Answer a save that was already made under `clientKey`, if it was. True when it
+ * responded.
+ *
+ * This is the retry after a save the *client* gave up on — a timeout on a multi-megabyte
+ * upload, a dropped connection, a closed tab — none of which can stop the write already
+ * running here, so the row landed anyway and the user was shown a failure. Retrying then
+ * duplicated the strip in their cart.
+ *
+ * Always ahead of both the cart cap and any bucket write: a replay must not be refused as
+ * `cart_full` by the very strip it is replaying, and re-storing bytes we already have
+ * would only orphan them.
+ */
+async function answerReplay(res: Response, userId: string, clientKey: string | null) {
+  const replayed = await findReplayedStrip(userId, clientKey)
+  // A retry so late that the strip it replays was unlocked and then removed from the
+  // gallery in between. Effectively unreachable (retries land within seconds), but
+  // answering with a strip whose images are gone would put a broken tile in the cart.
+  if (replayed?.removedAt) {
+    logger.info('strips.saveReplayedRemoved', { userId, stripId: replayed.id })
+    res.status(409).json({ error: 'strip_removed' })
+    return true
+  }
+  if (replayed) {
+    logger.info('strips.saveReplayed', { userId, stripId: replayed.id })
+    // 200, not 201: nothing was created. The client treats both as success.
+    res.status(200).json({ strip: serializeStrip(replayed) })
+    return true
+  }
+  return false
+}
+
+/**
+ * Whether the cart is already at its cap.
+ *
+ * Checked *before* anything is written to a bucket: rejecting after the upload would
+ * leave objects in R2 that no row names. Only unpaid strips count — a strip someone paid
+ * for is theirs to keep, and shouldn't stop them making another. Two tabs racing can land
+ * at cap + 1; that's accepted rather than paying for a serializable transaction.
+ */
+async function cartIsFull(userId: string): Promise<boolean> {
+  const unpaid = await prisma.strip.count({ where: { userId, paid: false } })
+  if (unpaid < env.stripMaxItems) return false
+  logger.info('strips.cartFull', { userId, unpaid, limit: env.stripMaxItems })
+  return true
+}
+
+/** Where a strip's images ended up, once they are at their permanent keys. */
+interface StoredStripKeys {
+  storageKey: string
+  thumbnailKey: string | null
+  printKey: string | null
+}
+
+/**
+ * Write the strip row (and its print copy's row) for images already at their permanent
+ * keys, and answer the request.
+ *
+ * One write for both rows. This is the whole point of saving both images together: a
+ * strip can't exist in the cart without the copy that makes it sellable, because there is
+ * no moment between the two where a failure or a closed tab can land.
+ */
+async function createStripRow(
+  res: Response,
+  userId: string,
+  strip: ValidatedStrip,
+  keys: StoredStripKeys,
+  meta: {
+    sessionId: string | null
+    sessionMode: string | null
+    createdAt: Date | undefined
+    clientKey: string | null
+  },
+  log: { bytes: number; direct: boolean },
+): Promise<void> {
+  const { storageKey, thumbnailKey, printKey } = keys
+  let created
+  try {
+    created = await prisma.strip.create({
+      data: {
+        userId,
+        storageKey,
+        thumbnailKey,
+        mimeType: strip.watermarkedType,
+        width: strip.dimensions.width,
+        height: strip.dimensions.height,
+        sessionId: meta.sessionId,
+        sessionMode: meta.sessionMode,
+        createdAt: meta.createdAt,
+        clientKey: meta.clientKey,
+        ...(printKey && strip.clean
+          ? {
+              printImage: {
+                create: {
+                  storageKey: printKey,
+                  mimeType: strip.clean.type,
+                  width: strip.clean.dimensions.width,
+                  height: strip.clean.dimensions.height,
+                },
+              },
+            }
+          : {}),
+      },
+      select: stripSummarySelect,
+    })
+  } catch (error) {
+    // The other half of the idempotency guard: two saves of the same strip in flight
+    // at once, so the replay check found nothing and the unique index caught it here.
+    // Rarer than the sequential retry, but the same user-visible bug — and it is why
+    // the index exists rather than the lookup alone.
+    const existing = isDuplicateClientKey(error)
+      ? await findReplayedStrip(userId, meta.clientKey)
+      : null
+    if (!existing) throw error
+    // The winner's objects are the ones the row names; ours are already unreachable.
+    // Drop them now — nothing else ever will, since no row will mention them.
+    await Promise.all([
+      deleteImages(
+        'public',
+        [storageKey, thumbnailKey].filter((key): key is string => !!key),
+      ),
+      deleteImages('private', printKey ? [printKey] : []),
+    ])
+    logger.info('strips.saveRaced', { userId, stripId: existing.id })
+    res.status(200).json({ strip: serializeStrip(existing) })
+    return
+  }
+  logger.info('strips.saved', {
+    userId,
+    stripId: created.id,
+    bytes: log.bytes,
+    // Which path the bytes took: straight to R2, or through this server. A `false` from
+    // a current client means its direct upload failed and it fell back — usually the
+    // bucket's CORS rule — and that save cost Railway egress.
+    direct: log.direct,
+    // False means this save has no replay protection — a legacy client, or one that
+    // dropped the key. A rise here is a duplicate-strip report waiting to happen.
+    idempotent: meta.clientKey !== null,
+    thumbnail: thumbnailKey !== null,
+    // Watch this: a `false` here is a strip that will never be sellable, and after the
+    // atomic save it should only ever come from a legacy single-image body.
+    printable: printKey !== null,
+  })
+  res.status(201).json({ strip: serializeStrip(created) })
+}
+
 // ── POST /strips ─── save a created strip to the cart ────────────────────────
+/**
+ * The strip's bytes in the request body (see `splitStripUpload`), stored by this server.
+ *
+ * Current clients upload straight to R2 instead (`/strips/uploads`, below) and come here
+ * only when that fails; older clients still use this alone. Every byte this route pushes
+ * to R2 is Railway egress, which is why it is no longer the first choice.
+ */
 stripsRouter.post(
   '/',
   requireAuth,
@@ -503,73 +717,16 @@ stripsRouter.post(
       return
     }
     const { watermarked, clean, thumbnail } = upload
-    // Trust the bytes, not the header the client sent with them — both halves. The
-    // sniffed type is what gets stored and served, so the two copies are free to be
-    // different formats: the client sends lossy WebP for one and lossless for the other.
-    const watermarkedType = sniffImageType(watermarked)
-    if (!isStripMimeType(watermarkedType)) {
-      res.status(400).json({ error: 'unsupported_image' })
-      return
-    }
-    // Checked in its own block rather than folded into the condition above, so the
-    // narrowed type survives to the write below instead of needing a cast there.
-    let cleanType: StripMimeType | null = null
-    if (clean) {
-      const sniffed = sniffImageType(clean)
-      if (!isStripMimeType(sniffed)) {
-        res.status(400).json({ error: 'unsupported_image' })
-        return
-      }
-      cleanType = sniffed
-    }
-    if (watermarked.length > STRIP_MAX_BYTES) {
-      res.status(413).json({ error: 'image_too_large' })
-      return
-    }
-    // Header-only, so this stays cheap and can't be turned into a decompression bomb.
-    const dimensions = await readImageSize(watermarked)
-    const cleanDimensions = clean ? await readImageSize(clean) : null
-    if (!dimensions || (clean && !cleanDimensions)) {
-      res.status(400).json({ error: 'invalid_input' })
+    const validated = await validateStripImages(watermarked, clean)
+    if (isRefusal(validated)) {
+      res.status(validated.status).json({ error: validated.error })
       return
     }
 
     const query = req.query as Record<string, unknown>
     const clientKey = readClientKey(query)
-
-    // Already saved under this key: answer with the strip that exists rather than
-    // making a second one. This is the retry after a save the *client* gave up on —
-    // a timeout on a multi-megabyte upload, a dropped connection, a closed tab — none
-    // of which can stop the write already running here, so the row landed anyway and
-    // the user was shown a failure. Retrying then duplicated the strip in their cart.
-    //
-    // Deliberately ahead of both the cart cap and the bucket writes: a replay must not
-    // be refused as `cart_full` by the very strip it is replaying, and re-uploading
-    // bytes we already stored would only orphan them.
-    const replayed = await findReplayedStrip(userId, clientKey)
-    // A retry so late that the strip it replays was unlocked and then removed from the
-    // gallery in between. Effectively unreachable (retries land within seconds), but
-    // answering with a strip whose images are gone would put a broken tile in the cart.
-    if (replayed?.removedAt) {
-      logger.info('strips.saveReplayedRemoved', { userId, stripId: replayed.id })
-      res.status(409).json({ error: 'strip_removed' })
-      return
-    }
-    if (replayed) {
-      logger.info('strips.saveReplayed', { userId, stripId: replayed.id })
-      // 200, not 201: nothing was created. The client treats both as success.
-      res.status(200).json({ strip: serializeStrip(replayed) })
-      return
-    }
-
-    // Cap the cart *before* anything is written to the bucket: rejecting after the
-    // upload would leave objects in R2 that no row names and nothing ever collects.
-    // Only unpaid strips count — a strip someone paid for is theirs to keep, and
-    // shouldn't stop them making another. Two tabs racing can land at cap + 1; that's
-    // accepted rather than paying for a serializable transaction to prevent it.
-    const unpaid = await prisma.strip.count({ where: { userId, paid: false } })
-    if (unpaid >= env.stripMaxItems) {
-      logger.info('strips.cartFull', { userId, unpaid, limit: env.stripMaxItems })
+    if (await answerReplay(res, userId, clientKey)) return
+    if (await cartIsFull(userId)) {
       res.status(409).json({ error: 'cart_full' })
       return
     }
@@ -583,83 +740,263 @@ stripsRouter.post(
     // reverse order would leave a broken image on the user's cart if the upload
     // failed; this way a failed insert only leaves an orphan object in the bucket.
     // The clean copy goes to the *private* bucket — it is the paid deliverable and is
-    // only ever streamed through the gate on `GET /strips/:id/print`.
+    // only ever handed out through the gate on `GET /strips/:id/print(-url)`.
     const [storageKey, thumbnailKey, printKey] = await Promise.all([
-      storeImage('public', watermarked, watermarkedType),
+      storeImage('public', watermarked, validated.watermarkedType),
       storeThumbnail(watermarked, thumbnail),
-      clean && cleanType ? storeImage('private', clean, cleanType) : Promise.resolve(null),
+      clean && validated.clean
+        ? storeImage('private', clean, validated.clean.type)
+        : Promise.resolve(null),
     ])
 
-    // One write for both rows. This is the whole point of carrying two images in one
-    // request: a strip can no longer exist in the cart without the copy that makes it
-    // sellable, because there is no longer a moment between the two where a failure or
-    // a closed tab can land.
-    let strip
-    try {
-      strip = await prisma.strip.create({
-        data: {
-          userId,
-          storageKey,
-          thumbnailKey,
-          mimeType: watermarkedType,
-          width: dimensions.width,
-          height: dimensions.height,
-          sessionId,
-          sessionMode,
-          createdAt,
-          clientKey,
-          ...(printKey && cleanDimensions && cleanType
-            ? {
-                printImage: {
-                  create: {
-                    storageKey: printKey,
-                    mimeType: cleanType,
-                    width: cleanDimensions.width,
-                    height: cleanDimensions.height,
-                  },
-                },
-              }
-            : {}),
-        },
-        select: stripSummarySelect,
-      })
-    } catch (error) {
-      // The other half of the idempotency guard: two saves of the same strip in flight
-      // at once, so the check above found nothing and the unique index caught it here.
-      // Rarer than the sequential retry, but the same user-visible bug — and it is why
-      // the index exists rather than the lookup alone.
-      const existing = isDuplicateClientKey(error)
-        ? await findReplayedStrip(userId, clientKey)
-        : null
-      if (!existing) throw error
-      // The winner's objects are the ones the row names; ours are already unreachable.
-      // Drop them now — nothing else ever will, since no row will mention them.
-      await Promise.all([
-        deleteImages(
-          'public',
-          [storageKey, thumbnailKey].filter((key): key is string => !!key),
-        ),
-        deleteImages('private', printKey ? [printKey] : []),
-      ])
-      logger.info('strips.saveRaced', { userId, stripId: existing.id })
-      res.status(200).json({ strip: serializeStrip(existing) })
-      return
-    }
-    logger.info('strips.saved', {
+    await createStripRow(
+      res,
       userId,
-      stripId: strip.id,
-      bytes: watermarked.length,
-      // False means this save has no replay protection — a legacy client, or one that
-      // dropped the key. A rise here is a duplicate-strip report waiting to happen.
-      idempotent: clientKey !== null,
-      thumbnail: thumbnailKey !== null,
-      // Watch this: a `false` here is a strip that will never be sellable, and after the
-      // atomic save it should only ever come from a legacy single-image body.
-      printable: printKey !== null,
-    })
-    res.status(201).json({ strip: serializeStrip(strip) })
+      validated,
+      { storageKey, thumbnailKey, printKey },
+      { sessionId, sessionMode, createdAt, clientKey },
+      { bytes: watermarked.length, direct: false },
+    )
   }),
 )
+
+// ── POST /strips/uploads ─── start a direct upload ───────────────────────────
+/**
+ * One file the client intends to upload, as it declared it. The declared size is signed
+ * into the PUT URL, so R2 enforces the bound checked here.
+ */
+function readDeclaredFile(
+  value: unknown,
+  types: readonly string[],
+  maxBytes: number,
+): { contentType: string; size: number } | null {
+  if (!value || typeof value !== 'object') return null
+  const { type, size } = value as { type?: unknown; size?: unknown }
+  if (typeof type !== 'string' || !types.includes(type)) return null
+  if (typeof size !== 'number' || !Number.isInteger(size) || size <= 0 || size > maxBytes) {
+    return null
+  }
+  return { contentType: type, size }
+}
+
+/**
+ * Start saving a strip whose bytes go browser → R2 directly, so they never cross this
+ * server and cost no Railway egress.
+ *
+ * Body (JSON): `{ watermarked: {type, size}, clean: {type, size}, thumbnail?: {type, size},
+ * sessionId?, mode?, createdAt?, clientKey? }` — the same metadata `POST /strips` takes as
+ * query params.
+ *
+ * Runs every check that can be run before the bytes exist — rate limit, replay, cart cap,
+ * declared types and sizes — so a refused save never uploads anything. Answers either
+ * `{ strip }` (a replay: already saved, nothing to upload) or
+ * `{ upload: { token, files } }`, a presigned PUT per file under `incoming/` in the
+ * private bucket — every file, including the ones that end up public — plus the
+ * grant that completes them. The bytes themselves are checked at completion, after they
+ * land; nothing here trusts the declared type beyond choosing what to sign.
+ *
+ * A thumbnail that doesn't fit the bounds is dropped rather than refused — the server
+ * renders one at completion, the same as the raw route does.
+ */
+stripsRouter.post(
+  '/uploads',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const userId = req.userId as string
+    if (!requireStorage(res)) return
+    if (!stripLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const watermarked = readDeclaredFile(body.watermarked, STRIP_MIME_TYPES, STRIP_MAX_BYTES)
+    const clean = readDeclaredFile(body.clean, STRIP_MIME_TYPES, STRIP_MAX_BYTES)
+    if (!watermarked || !clean) {
+      res.status(400).json({ error: 'invalid_input' })
+      return
+    }
+    const thumbnail = readDeclaredFile(body.thumbnail, [THUMBNAIL_MIME], THUMBNAIL_BOUNDS.maxBytes)
+
+    // A direct save always has a key: completion is a second request, and the key is
+    // what makes repeating it — or falling back to `POST /strips` after it — harmless.
+    // Minted here for a client that sent none; that client can't reuse it on its own
+    // fallback, but completion stays idempotent.
+    const clientKey = readClientKey(body) ?? crypto.randomUUID()
+    if (await answerReplay(res, userId, clientKey)) return
+    if (await cartIsFull(userId)) {
+      res.status(409).json({ error: 'cart_full' })
+      return
+    }
+
+    const { sessionId, sessionMode } = readSessionMeta(body)
+    const createdAt = readCreatedAt(body, Date.now())
+    const granted = {
+      watermarked: { key: incomingKey(), ...watermarked },
+      clean: { key: incomingKey(), ...clean },
+      thumbnail: thumbnail ? { key: incomingKey(), ...thumbnail } : null,
+    }
+    // All three land in the private upload bucket, the watermarked copy and the preview
+    // included: nothing unvalidated may sit where a public origin can serve it. They
+    // only reach the public bucket by being promoted at completion.
+    const presign = (file: { key: string; contentType: string; size: number }) =>
+      presignedPutUrl(UPLOAD_BUCKET, file.key, {
+        contentType: file.contentType,
+        contentLength: file.size,
+      }).then((url) => ({ url, contentType: file.contentType }))
+    const [watermarkedPut, cleanPut, thumbnailPut] = await Promise.all([
+      presign(granted.watermarked),
+      presign(granted.clean),
+      granted.thumbnail ? presign(granted.thumbnail) : Promise.resolve(null),
+    ])
+
+    const token = signUploadGrant({
+      kind: 'strip',
+      userId,
+      ...granted,
+      clientKey,
+      sessionId,
+      sessionMode,
+      createdAt: createdAt?.toISOString() ?? null,
+    })
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.json({
+      upload: {
+        token,
+        files: { watermarked: watermarkedPut, clean: cleanPut, thumbnail: thumbnailPut },
+      },
+    })
+  }),
+)
+
+// ── POST /strips/uploads/complete ─── validate, promote, save ────────────────
+/**
+ * Finish a direct upload: read what landed under `incoming/` in the private upload
+ * bucket, run exactly the checks `POST /strips` runs on a body, copy each file to its
+ * permanent key — the watermarked copy and the preview across to the public bucket, the
+ * clean copy within the private one — and write the row. Nothing reaches the public
+ * bucket without passing those checks first.
+ *
+ * Body (JSON): `{ token }` from `POST /strips/uploads`. The token, not the client, says
+ * which objects to read and what metadata to save, so nothing here is client-chosen.
+ *
+ * Reading the objects back is ingress (free); the copies happen inside R2. The only bytes
+ * this route pushes out are a server-rendered thumbnail, when the client's own was
+ * missing or failed its checks.
+ *
+ * `409 upload_incomplete` means a granted file isn't in the bucket — the PUT never
+ * finished. The client falls back to `POST /strips` on that, with the same `clientKey`.
+ */
+stripsRouter.post(
+  '/uploads/complete',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const userId = req.userId as string
+    if (!requireStorage(res)) return
+    const grant = verifyUploadGrant(
+      (req.body as { token?: unknown } | undefined)?.token,
+      'strip',
+      userId,
+    )
+    if (!grant) {
+      res.status(400).json({ error: 'invalid_upload' })
+      return
+    }
+    const incoming = [grant.watermarked.key, grant.clean.key, grant.thumbnail?.key].filter(
+      (key): key is string => !!key,
+    )
+    // Best-effort, like every delete: the lifecycle rule on `incoming/` is the backstop.
+    const dropIncoming = () => deleteImages(UPLOAD_BUCKET, incoming)
+
+    // Completing twice (a retry whose first attempt actually landed) answers with the
+    // strip that exists. Whatever this attempt uploaded is surplus.
+    if (await answerReplay(res, userId, grant.clientKey)) {
+      await dropIncoming()
+      return
+    }
+
+    const [watermarked, clean, thumbnail] = await Promise.all([
+      readObject(UPLOAD_BUCKET, grant.watermarked.key, STRIP_MAX_BYTES),
+      readObject(UPLOAD_BUCKET, grant.clean.key, STRIP_MAX_BYTES),
+      grant.thumbnail
+        ? readObject(UPLOAD_BUCKET, grant.thumbnail.key, THUMBNAIL_BOUNDS.maxBytes)
+        : Promise.resolve(null),
+    ])
+    if (!watermarked || !clean) {
+      res.status(409).json({ error: 'upload_incomplete' })
+      return
+    }
+    const validated = await validateStripImages(watermarked, clean)
+    if (isRefusal(validated) || !validated.clean) {
+      await dropIncoming()
+      const refusal = isRefusal(validated) ? validated : { status: 400, error: 'invalid_input' }
+      res.status(refusal.status).json({ error: refusal.error })
+      return
+    }
+    // Again, now that the bytes are here: the cart may have filled while they uploaded.
+    if (await cartIsFull(userId)) {
+      await dropIncoming()
+      res.status(409).json({ error: 'cart_full' })
+      return
+    }
+
+    const storageKey = stripKey('watermarked', validated.watermarkedType)
+    const printKey = stripKey('print', validated.clean.type)
+    try {
+      await Promise.all([
+        promoteObject(grant.watermarked.key, 'public', storageKey, validated.watermarkedType),
+        promoteObject(grant.clean.key, 'private', printKey, validated.clean.type),
+      ])
+    } catch (error) {
+      // One copy may have landed; with no row naming it, it is an orphan unless dropped.
+      await Promise.all([deleteImages('public', [storageKey]), deleteImages('private', [printKey])])
+      throw error
+    }
+    const thumbnailKey = await promoteThumbnail(
+      grant.thumbnail?.key ?? null,
+      thumbnail,
+      watermarked,
+    )
+
+    await createStripRow(
+      res,
+      userId,
+      validated,
+      { storageKey, thumbnailKey, printKey },
+      {
+        sessionId: grant.sessionId,
+        sessionMode: grant.sessionMode,
+        createdAt: grant.createdAt ? new Date(grant.createdAt) : undefined,
+        clientKey: grant.clientKey,
+      },
+      { bytes: watermarked.length, direct: true },
+    )
+    // After the row, so a failure above leaves the uploads for a retry to complete.
+    await dropIncoming()
+  }),
+)
+
+/**
+ * The direct-upload twin of `storeThumbnail`: promote the client's preview in place when
+ * it passes the same checks, and only otherwise render one here. Null on any failure —
+ * a strip with no thumbnail still works.
+ */
+async function promoteThumbnail(
+  incoming: string | null,
+  supplied: Buffer | null,
+  watermarked: Buffer,
+): Promise<string | null> {
+  if (incoming && (await acceptableThumbnail(supplied))) {
+    const key = stripKey('thumbnail', THUMBNAIL_MIME)
+    try {
+      await promoteObject(incoming, 'public', key, THUMBNAIL_MIME)
+      return key
+    } catch (error) {
+      logger.warn('thumbnail.promote.failed', { message: (error as Error).message })
+    }
+  }
+  return storeThumbnail(watermarked, null)
+}
 
 /**
  * How many more strips the gallery can take, given what the user has unlocked already.
@@ -1064,136 +1401,115 @@ stripsRouter.get(
   }),
 )
 
-// ── POST /strips/:id/print-image ─── store the clean (paid) copy ─────────────
+// ── The clean copy's gate ───────────────────────────────────────────────────
+/** What the paid download needs once the gate has passed. */
+interface CleanCopy {
+  key: string
+  mimeType: string
+  filename: string
+}
+
 /**
- * Attach the clean, watermark-free copy to a strip that already exists.
+ * Decide whether the caller may have this strip's clean copy, and answer for them if not.
  *
- * **No longer the normal path.** `POST /strips` carries both images and writes them
- * together, precisely so there is no window in which a strip exists without its clean
- * copy. This remains for the two cases that can't use the atomic save: an older client
- * still doing save-then-attach during a deploy, and any future repair of a row that
- * predates the change. Stored locked in `StripPrintImage`; only ever served through the
- * paid `GET /strips/:id/print`.
+ * Shared by both ways of handing it over (`/print` streams it, `/print-url` signs a URL
+ * for it), so they can never drift apart on who gets the file: owner only, paid when
+ * `env.paymentsEnabled`, and a 404 for anything that doesn't resolve. Returns null once
+ * it has responded.
  */
-stripsRouter.post(
-  '/:id/print-image',
-  requireAuth,
-  stripBody,
-  asyncRoute(async (req, res) => {
-    const userId = req.userId as string
-    if (!requireStorage(res)) return
-    if (!stripLimiter.allow(userId)) {
-      res.status(429).json({ error: 'too_many_requests' })
-      return
-    }
-    // Must own the strip we're attaching a print image to. (Metadata only — the
-    // strip's own pixels are irrelevant here, and used to be loaded for nothing.)
-    const strip = await prisma.strip.findUnique({
-      where: { id: req.params.id },
-      select: { id: true, userId: true, printImage: { select: { storageKey: true } } },
-    })
-    if (!strip || strip.userId !== userId) {
-      res.status(404).json({ error: 'not_found' })
-      return
-    }
-
-    const bytes: unknown = req.body
-    if (!Buffer.isBuffer(bytes) || bytes.length === 0) {
-      res.status(400).json({ error: 'invalid_input' })
-      return
-    }
-    const contentType = sniffImageType(bytes)
-    if (!isStripMimeType(contentType)) {
-      res.status(400).json({ error: 'unsupported_image' })
-      return
-    }
-    const dimensions = await readImageSize(bytes)
-    if (!dimensions) {
-      res.status(400).json({ error: 'invalid_input' })
-      return
-    }
-
-    // The clean copy is the paid deliverable, so it goes to the *private* bucket and
-    // is only ever streamed through the gate below — never given out as a CDN URL.
-    const storageKey = await storeImage('private', bytes, contentType)
-    const fields = {
-      storageKey,
-      mimeType: contentType,
-      width: dimensions.width,
-      height: dimensions.height,
-    }
-    await prisma.stripPrintImage.upsert({
-      where: { stripId: strip.id },
-      create: { stripId: strip.id, ...fields },
-      update: fields,
-    })
-    // Replacing a print image strands whichever object the row used to name.
-    const replaced = strip.printImage?.storageKey
-    if (replaced && replaced !== storageKey) await deleteImages('private', [replaced])
-
-    logger.info('strips.printImage.saved', { userId, stripId: strip.id, bytes: bytes.length })
-    res.status(204).end()
-  }),
-)
+async function authorizeCleanCopy(req: Request, res: Response): Promise<CleanCopy | null> {
+  const userId = req.userId as string
+  const id = req.params.id as string
+  const strip = await prisma.strip.findUnique({
+    where: { id },
+    // Ownership and the paid gate are decided on metadata alone — the image is
+    // only reached for once both have passed, so a 402 costs nothing.
+    select: {
+      userId: true,
+      paid: true,
+      printImage: { select: { mimeType: true, storageKey: true } },
+    },
+  })
+  if (!strip || strip.userId !== userId) {
+    res.status(404).json({ error: 'not_found' })
+    return null
+  }
+  if (env.paymentsEnabled && !strip.paid) {
+    res.status(402).json({ error: 'payment_required' })
+    return null
+  }
+  const key = strip.printImage?.storageKey
+  if (!strip.printImage || !key) {
+    res.status(404).json({ error: 'not_found' })
+    return null
+  }
+  const { mimeType } = strip.printImage
+  // The extension has to follow the stored bytes. The gallery re-encodes to PNG in
+  // the browser and names the file itself, so this is what a direct hit on the URL
+  // gets — and a `.png` full of WebP is worse than an honest `.webp`.
+  const extension = mimeType === 'image/webp' ? 'webp' : 'png'
+  return { key, mimeType, filename: `momoto-strip-${id}.${extension}` }
+}
 
 // ── GET /strips/:id/print ─── serve the clean copy (owner only) ──────────────
 /**
  * The clean deliverable — the single file used for both "download" and "print".
  * Auth-gated (unlike the free watermarked image, which is unauth-by-cuid).
  * When `env.paymentsEnabled`, the strip must also be paid.
+ *
+ * Streams through this server, which bills Railway egress on every download. The app
+ * now asks `/print-url` first and only lands here as a fallback; this stays because a
+ * FE from before that route existed still calls it, and because it is the fallback.
  */
 stripsRouter.get(
   '/:id/print',
   requireAuth,
   asyncRoute(async (req, res) => {
-    const userId = req.userId as string
-    const strip = await prisma.strip.findUnique({
-      where: { id: req.params.id },
-      // Ownership and the paid gate are decided on metadata alone — the image is
-      // only reached for once both have passed, so a 402 costs nothing.
-      select: {
-        userId: true,
-        paid: true,
-        printImage: { select: { mimeType: true, storageKey: true } },
-      },
-    })
-    if (!strip || strip.userId !== userId) {
-      res.status(404).json({ error: 'not_found' })
-      return
-    }
-    if (env.paymentsEnabled && !strip.paid) {
-      res.status(402).json({ error: 'payment_required' })
-      return
-    }
-    if (!strip.printImage) {
-      res.status(404).json({ error: 'not_found' })
-      return
-    }
+    const copy = await authorizeCleanCopy(req, res)
+    if (!copy) return
 
     // Streamed from the private bucket, through this gate — the file the user paid
     // for never gets a public URL.
-    const key = strip.printImage.storageKey
-    if (!key) {
-      res.status(404).json({ error: 'not_found' })
-      return
-    }
-
-    res.setHeader('Content-Type', strip.printImage.mimeType)
-    // The extension has to follow the stored bytes. The gallery re-encodes to PNG in
-    // the browser and names the file itself, so this header is what a direct hit on
-    // this URL gets — and a `.png` full of WebP is worse than an honest `.webp`.
-    const extension = strip.printImage.mimeType === 'image/webp' ? 'webp' : 'png'
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="momoto-strip-${req.params.id}.${extension}"`,
-    )
+    res.setHeader('Content-Type', copy.mimeType)
+    res.setHeader('Content-Disposition', `attachment; filename="${copy.filename}"`)
     // Private paid content — don't let shared caches keep it.
     res.setHeader('Cache-Control', 'private, no-store')
     res.setHeader('X-Content-Type-Options', 'nosniff')
 
-    if (!(await serveImage(res, 'private', key))) {
+    if (!(await serveImage(res, 'private', copy.key))) {
       res.status(404).json({ error: 'not_found' })
     }
+  }),
+)
+
+// ── GET /strips/:id/print-url ─── a 60-second R2 URL for the clean copy ──────
+/**
+ * Same gate as `/print`, but instead of the bytes it returns `{ url, expiresAt }`: a
+ * presigned GET the browser fetches straight from the private bucket, so the download
+ * costs no Railway egress. Still never a public or long-lived URL — it names one
+ * object, expires in a minute, and is only minted after the owner + paid checks.
+ *
+ * The browser fetches it cross-origin, so the private bucket needs a CORS rule for the
+ * app's origins (docs/ARCHITECTURE.md §5) and the R2 host must be in the FE's
+ * `connect-src`. If either is missing the FE falls back to `/print`.
+ *
+ * Doesn't check the object exists — that would be an R2 round trip on every download
+ * to catch a case that is already a 404 from R2 itself, which the FE treats as failed.
+ */
+stripsRouter.get(
+  '/:id/print-url',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const copy = await authorizeCleanCopy(req, res)
+    if (!copy) return
+
+    const { url, expiresAt } = await presignedGetUrl('private', copy.key, {
+      filename: copy.filename,
+      contentType: copy.mimeType,
+    })
+    // The URL is a bearer credential for a minute; nothing should keep it.
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.json({ url, expiresAt: expiresAt.toISOString() })
   }),
 )
 
