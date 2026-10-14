@@ -16,9 +16,15 @@ import {
   type Bucket,
   deleteImages,
   getImageStream,
+  incomingKey,
+  presignedGetUrl,
+  presignedPutUrl,
+  promoteObject,
   publicUrl,
   putImage,
+  readObject,
   storageEnabled,
+  UPLOAD_BUCKET,
 } from '../src/storage/objectStore.js'
 import { makeThumbnail } from '../src/storage/thumbnail.js'
 
@@ -127,6 +133,178 @@ async function checkPublicUrl(bucket: Bucket, key: string, variable: string): Pr
   }
 }
 
+/**
+ * Fetch the private probe through a presigned URL, the way the gallery's download does.
+ *
+ * Proves two things an S3 round trip can't: that this endpoint accepts our signatures
+ * over plain HTTPS (a MinIO `R2_ENDPOINT` included), and that the bucket's CORS policy
+ * lets the frontend read the response. The second is what fails silently in production
+ * — the app falls back to streaming through the API, so downloads still work and only
+ * the Railway bill says anything is wrong.
+ */
+async function checkPresignedGet(key: string, printBucket: string): Promise<void> {
+  const origin = env.appBaseUrl
+  let url: string
+  try {
+    const presigned = await presignedGetUrl('private', key, {
+      filename: 'momoto-probe.png',
+      contentType: 'image/png',
+    })
+    url = presigned.url
+  } catch (error) {
+    fail('presign', (error as Error).message)
+    return
+  }
+  try {
+    // Node's fetch lets us set `Origin`, which a browser would set by itself.
+    const response = await fetch(url, { headers: { Origin: origin } })
+    if (!response.ok) {
+      fail(
+        'presigned GET',
+        `HTTP ${response.status}`,
+        response.status === 403
+          ? 'The signature was refused. Check the server clock and that R2_ENDPOINT is the ' +
+              'host the browser will reach (a presigned URL is signed for one host).'
+          : undefined,
+      )
+      return
+    }
+    const body = Buffer.from(await response.arrayBuffer())
+    if (!body.equals(PROBE)) {
+      fail('presigned GET', 'returned something other than the object we wrote')
+      return
+    }
+    pass('presigned GET serves the private object', new URL(url).host)
+
+    const disposition = response.headers.get('content-disposition') ?? ''
+    if (disposition.startsWith('attachment')) pass('signed Content-Disposition applied')
+    else fail('signed Content-Disposition', `got "${disposition}", expected attachment; ...`)
+
+    const allowed = response.headers.get('access-control-allow-origin')
+    if (allowed === origin || allowed === '*') {
+      pass(`CORS allows ${origin}`)
+    } else {
+      fail(
+        `CORS for ${origin}`,
+        allowed ? `bucket allows "${allowed}" instead` : 'no Access-Control-Allow-Origin header',
+        `Add ${origin} to the CORS policy of "${printBucket}" (R2 → the bucket → Settings → ` +
+          'CORS policy; the exact rule is in docs/ARCHITECTURE.md §5). Until then every ' +
+          'gallery download falls back to streaming through the API.',
+      )
+    }
+  } catch (error) {
+    fail('presigned GET', (error as Error).message, 'Is R2_ENDPOINT reachable from here?')
+  }
+}
+
+/**
+ * Run one direct upload the way the browser does: presign a PUT under `incoming/` in the
+ * private upload bucket, prove R2 refuses a body of the wrong size, PUT the real one, and
+ * promote it into every bucket a direct upload can end up in — across buckets for the
+ * public ones, which is what keeps unvalidated bytes off any public origin. Then ask the
+ * upload bucket whether a browser on the app's origin may send that PUT at all — the CORS
+ * preflight — which is the part that fails silently: the app falls back to uploading
+ * through the API, and only the Railway bill notices.
+ *
+ * Returns the keys it created, per bucket, so the caller can clean them up.
+ */
+async function checkDirectUpload(
+  uploadBucketName: string,
+  targets: [Bucket, string][],
+): Promise<[Bucket, string[]][]> {
+  const label = `direct upload into "${uploadBucketName}"`
+  const incoming = incomingKey()
+  const created: [Bucket, string[]][] = [[UPLOAD_BUCKET, [incoming]]]
+  let url: string
+  try {
+    url = await presignedPutUrl(UPLOAD_BUCKET, incoming, {
+      contentType: 'image/png',
+      contentLength: PROBE.length,
+    })
+  } catch (error) {
+    fail(`${label}: presign`, (error as Error).message)
+    return created
+  }
+  try {
+    const oversized = await fetch(url, {
+      method: 'PUT',
+      body: Buffer.concat([PROBE, Buffer.from([0])]),
+      headers: { 'Content-Type': 'image/png' },
+    })
+    if (oversized.ok) {
+      fail(
+        `${label}: size bound`,
+        'R2 accepted a body larger than the signed Content-Length',
+        'The declared size is what the server bounds — without this, a client could upload anything.',
+      )
+    } else {
+      pass(`${label}: refuses a body of the wrong size`, `HTTP ${oversized.status}`)
+    }
+
+    const put = await fetch(url, {
+      method: 'PUT',
+      body: PROBE,
+      headers: { 'Content-Type': 'image/png' },
+    })
+    if (!put.ok) {
+      fail(`${label}: PUT`, `HTTP ${put.status}`)
+      return created
+    }
+    pass(`${label}: PUT`)
+  } catch (error) {
+    fail(label, (error as Error).message, 'Is R2_ENDPOINT reachable from here?')
+    return created
+  }
+
+  for (const [bucket, name] of targets) {
+    const promoted = `_healthcheck/${crypto.randomUUID()}.png`
+    created.push([bucket, [promoted]])
+    try {
+      await promoteObject(incoming, bucket, promoted, 'image/png')
+      const back = await readObject(bucket, promoted, PROBE.length)
+      if (back?.equals(PROBE)) pass(`promote from incoming/ into "${name}"`)
+      else fail(`promote into "${name}"`, 'the promoted object does not match what was uploaded')
+    } catch (error) {
+      fail(
+        `promote into "${name}"`,
+        (error as Error).message,
+        `The R2 token needs read on "${uploadBucketName}" and write on "${name}" for the ` +
+          'server-side copy.',
+      )
+    }
+  }
+
+  const origin = env.appBaseUrl
+  try {
+    const preflight = await fetch(url, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: origin,
+        'Access-Control-Request-Method': 'PUT',
+        'Access-Control-Request-Headers': 'content-type',
+      },
+    })
+    const allowed = preflight.headers.get('access-control-allow-origin')
+    const methods = preflight.headers.get('access-control-allow-methods') ?? ''
+    if ((allowed === origin || allowed === '*') && /\bPUT\b/i.test(methods)) {
+      pass(`${label}: CORS allows PUT from ${origin}`)
+    } else {
+      fail(
+        `${label}: CORS for ${origin}`,
+        allowed
+          ? `allows origin "${allowed}" with methods "${methods}"`
+          : `no Access-Control-Allow-Origin on the preflight (HTTP ${preflight.status})`,
+        `Add ${origin} with methods GET and PUT and header content-type to the CORS policy ` +
+          `of "${uploadBucketName}" (exact rule in docs/ARCHITECTURE.md §5). Until then every ` +
+          'upload falls back to going through the API.',
+      )
+    }
+  } catch (error) {
+    fail(`${label}: CORS preflight`, (error as Error).message)
+  }
+  return created
+}
+
 async function main(): Promise<void> {
   console.log('\nR2 configuration check\n')
 
@@ -172,6 +350,23 @@ async function main(): Promise<void> {
     await checkPublicUrl('avatar', avatarKey, 'R2_AVATAR_PUBLIC_BASE_URL')
   }
 
+  console.log('\n  Direct downloads (print bucket)')
+  if (privateKey) await checkPresignedGet(privateKey, r2.printBucket)
+
+  console.log('\n  Direct uploads')
+  // The avatar role may resolve to the strips bucket; promoting into it twice would say
+  // nothing new.
+  const uploadProbes = await checkDirectUpload(r2.printBucket, [
+    ['public', r2.bucket],
+    ['private', r2.printBucket],
+    ...(r2.avatarBucket !== r2.bucket ? [['avatar', r2.avatarBucket] as [Bucket, string]] : []),
+  ])
+  warn(
+    `Lifecycle rules cannot be checked with this token. Confirm by hand that "${r2.printBucket}"`,
+  )
+  console.log('        has a rule deleting `incoming/` after 1 day — abandoned direct uploads')
+  console.log('        are collected by nothing else.')
+
   console.log('\n  Thumbnails')
   const thumbnail = await makeThumbnail(PROBE)
   if (thumbnail) pass('sharp can render a WebP preview', `${thumbnail.length} bytes`)
@@ -182,6 +377,7 @@ async function main(): Promise<void> {
     publicKey ? deleteImages('public', [publicKey]) : Promise.resolve(),
     privateKey ? deleteImages('private', [privateKey]) : Promise.resolve(),
     avatarKey ? deleteImages('avatar', [avatarKey]) : Promise.resolve(),
+    ...uploadProbes.map(([bucket, keys]) => deleteImages(bucket, keys)),
   ])
 
   if (failures > 0) {
