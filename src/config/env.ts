@@ -103,6 +103,27 @@ export interface Env {
    * nothing to show. Nothing already unlocked is ever auto-evicted.
    */
   galleryMaxItems: number
+  // ── Scrapbooks (docs/PLAN-scrapbook.md) ──
+  /**
+   * Price of one scrapbook, in whole rupiah, or null while it hasn't been decided.
+   *
+   * **No default on purpose.** A made-up fallback would be charged the moment payments
+   * were on; null instead makes scrapbook checkout answer `503 scrapbook_price_unset`.
+   * It deliberately doesn't refuse to boot: staging runs with payments on, and the rest
+   * of checkout (strips) must keep working while this one price is still open.
+   */
+  scrapbookPriceIdr: number | null
+  /**
+   * How many scrapbooks one user may hold at a time: drafts, finished and paid alike
+   * (removed ones don't count). Separate from both strip caps — a scrapbook never lives
+   * in the cart or the gallery. Checked at create and duplicate.
+   */
+  scrapbookMaxItems: number
+  /**
+   * Ceiling on a finished scrapbook's PDF. Expected ~2 MB for flat vector art (plan
+   * §7a); this is the backstop, and what the presigned PUT signs as the most it allows.
+   */
+  scrapbookPdfMaxBytes: number
   // ── Object storage (Cloudflare R2) ──
   /** R2 connection, or null when strip bytes should stay in Postgres. */
   r2: R2Config | null
@@ -191,6 +212,12 @@ function positiveInt(name: string, raw: string | undefined, fallback: number): n
     throw new Error(`Invalid ${name}: "${raw}" (expected a positive integer)`)
   }
   return n
+}
+
+/** Like `positiveInt`, but unset means null rather than a fallback. */
+function optionalPositiveInt(name: string, raw: string | undefined): number | null {
+  if (raw === undefined || raw.trim() === '') return null
+  return positiveInt(name, raw, 0)
 }
 
 function nonNegativeInt(name: string, raw: string | undefined, fallback: number): number {
@@ -394,5 +421,12 @@ export const env: Env = {
     Boolean(process.env.MIDTRANS_SERVER_KEY?.trim() && process.env.MIDTRANS_CLIENT_KEY?.trim()),
   stripMaxItems: positiveInt('STRIP_MAX_ITEMS', process.env.STRIP_MAX_ITEMS, 5),
   galleryMaxItems: positiveInt('GALLERY_MAX_ITEMS', process.env.GALLERY_MAX_ITEMS, 25),
+  scrapbookPriceIdr: optionalPositiveInt('SCRAPBOOK_PRICE_IDR', process.env.SCRAPBOOK_PRICE_IDR),
+  scrapbookMaxItems: positiveInt('SCRAPBOOK_MAX_ITEMS', process.env.SCRAPBOOK_MAX_ITEMS, 5),
+  scrapbookPdfMaxBytes: positiveInt(
+    'SCRAPBOOK_PDF_MAX_BYTES',
+    process.env.SCRAPBOOK_PDF_MAX_BYTES,
+    12 * 1024 * 1024,
+  ),
   r2: parseR2(),
 }

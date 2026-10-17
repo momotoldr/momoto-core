@@ -254,7 +254,7 @@ export const stripSummarySelect = {
  * stays the relative `/strips/:id`, which the client resolves against the API base and
  * this server proxies from the bucket — so the contract is "a URL" either way.
  */
-function serializeStrip(strip: SerializableStrip) {
+export function serializeStrip(strip: SerializableStrip) {
   const cdn = strip.storageKey ? publicUrl('public', strip.storageKey) : null
   // Absolute when served from the CDN; otherwise relative to this API's origin,
   // and the client prefixes it with the API base URL.
@@ -331,7 +331,7 @@ async function storeImage(
  * just isn't presently able to accept strips. The rest of the API (auth, rooms) still
  * works, which is why this isn't a refuse-to-boot check.
  */
-function requireStorage(res: Response): boolean {
+export function requireStorage(res: Response): boolean {
   if (storageEnabled) return true
   logger.error('strips.storageUnavailable', {
     msg: 'Object storage is not configured; strips cannot be saved. Set R2_ACCOUNT_ID etc.',
@@ -393,7 +393,7 @@ async function acceptableThumbnail(bytes: Buffer | null): Promise<Buffer | null>
  * buffering) matters here: these are multi-megabyte PNGs, and holding each one whole
  * in the heap is what made concurrent loads slow on a small instance.
  */
-async function serveImage(res: Response, bucket: Bucket, key: string): Promise<boolean> {
+export async function serveImage(res: Response, bucket: Bucket, key: string): Promise<boolean> {
   const stream = await getImageStream(bucket, key)
   if (!stream) return false
   stream.pipe(res)
@@ -765,7 +765,7 @@ stripsRouter.post(
  * One file the client intends to upload, as it declared it. The declared size is signed
  * into the PUT URL, so R2 enforces the bound checked here.
  */
-function readDeclaredFile(
+export function readDeclaredFile(
   value: unknown,
   types: readonly string[],
   maxBytes: number,

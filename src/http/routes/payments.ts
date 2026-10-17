@@ -1,18 +1,26 @@
 import { randomUUID } from 'node:crypto'
 
-import { Router } from 'express'
+import { Router, type Response as ExpressResponse } from 'express'
 
 import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
 import {
+  cancelTransaction,
   chargeTransaction,
   isPaymentMethod,
+  type PaymentMethod,
   verifyNotificationSignature,
 } from '../../payments/midtrans.js'
 import { asyncRoute } from '../asyncRoute.js'
 import { requireAuth } from '../middleware/requireAuth.js'
+import {
+  coverUrlOf,
+  findPurchasableScrapbook,
+  hasLivePayment,
+  lockScrapbook,
+} from './scrapbooks.js'
 import { findPurchasableStrips, galleryRoomFor, refusePurchase } from './strips.js'
 
 export const paymentsRouter = Router()
@@ -47,8 +55,12 @@ function serializePayment(payment: {
   deeplinkUrl: string | null
   expiresAt: Date | null
   strips: { id: string }[]
+  scrapbooks: { id: string }[]
 }) {
   return {
+    // What the order is for. A payment holds strips or one scrapbook, never both, so the
+    // client can tell a resumed scrapbook payment from a cart one without guessing.
+    kind: payment.scrapbooks.length > 0 ? ('scrapbook' as const) : ('strips' as const),
     orderId: payment.orderId,
     status: payment.status,
     grossAmount: payment.grossAmount,
@@ -57,6 +69,8 @@ function serializePayment(payment: {
     deeplinkUrl: payment.deeplinkUrl,
     expiresAt: payment.expiresAt?.toISOString() ?? null,
     stripIds: payment.strips.map((strip) => strip.id),
+    scrapbookIds: payment.scrapbooks.map((scrapbook) => scrapbook.id),
+    // Strips only, as it always was: the cart's "n strips" line reads it.
     count: payment.strips.length,
   }
 }
@@ -71,6 +85,7 @@ const PAYMENT_SELECT = {
   deeplinkUrl: true,
   expiresAt: true,
   strips: { select: { id: true } },
+  scrapbooks: { select: { id: true } },
 } as const
 
 /**
@@ -110,12 +125,22 @@ paymentsRouter.post(
       return
     }
 
-    const body = req.body as { stripIds?: unknown; method?: unknown }
+    const body = req.body as { stripIds?: unknown; scrapbookId?: unknown; method?: unknown }
     if (!isPaymentMethod(body.method)) {
       res.status(400).json({ error: 'invalid_method' })
       return
     }
     const method = body.method
+
+    // A payment is for strips or for one scrapbook, never both.
+    if (body.scrapbookId !== undefined) {
+      if (body.stripIds !== undefined || typeof body.scrapbookId !== 'string') {
+        res.status(400).json({ error: 'invalid_input' })
+        return
+      }
+      await chargeScrapbook(res, userId, body.scrapbookId, method)
+      return
+    }
 
     // De-dupe + validate the requested ids.
     const stripIds = Array.isArray(body.stripIds)
@@ -169,7 +194,9 @@ paymentsRouter.post(
       orderId,
       unitPrice,
       quantity: strips.length,
+      itemId: 'strip-print',
       itemName: 'Momoto strip print',
+      returnPath: '/cart',
       customer: { name: user?.displayName ?? 'Momoto user', email: user?.email ?? null },
       method,
     })
@@ -198,6 +225,109 @@ paymentsRouter.post(
     res.status(201).json(serializePayment(payment))
   }),
 )
+
+/**
+ * The scrapbook branch of `/charge`: one finished, unpaid scrapbook at
+ * `SCRAPBOOK_PRICE_IDR`.
+ *
+ * The check is made twice. Once before Midtrans is called, so an obvious refusal costs no
+ * transaction. And again **under the scrapbook's row lock** when the payment is recorded,
+ * because the Midtrans call takes seconds and can't sit inside a database transaction: a
+ * reopen (which deletes the PDF) or a second tab's checkout could land in between, and
+ * either would leave money able to settle on a scrapbook with nothing to download. If the
+ * second check fails, the transaction just opened is cancelled at Midtrans — its QR was
+ * never sent to anyone — and the request is refused as the first check would have been.
+ */
+async function chargeScrapbook(
+  res: ExpressResponse,
+  userId: string,
+  scrapbookId: string,
+  method: PaymentMethod,
+): Promise<void> {
+  // No default price on purpose (see `env.scrapbookPriceIdr`): unset, nothing is charged.
+  const price = env.scrapbookPriceIdr
+  if (price === null) {
+    logger.warn('payments.charge.scrapbookPriceUnset', { userId })
+    res.status(503).json({ error: 'scrapbook_price_unset' })
+    return
+  }
+
+  // One live attempt per user, whatever it's for — the same rule as strips.
+  const live = await findLivePayment(userId)
+  if (live) {
+    logger.info('payments.charge.inProgress', { userId, orderId: live.orderId })
+    res.status(409).json({ error: 'payment_in_progress', payment: serializePayment(live) })
+    return
+  }
+
+  const purchasable = await findPurchasableScrapbook(userId, scrapbookId)
+  if (!purchasable.ok) {
+    logger.info('scrapbooks.notPurchasable', { route: 'charge', userId, error: purchasable.error })
+    res.status(purchasable.status).json({ error: purchasable.error })
+    return
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { displayName: true, email: true },
+  })
+  const orderId = `pay_${randomUUID()}`
+  const charge = await chargeTransaction({
+    orderId,
+    unitPrice: price,
+    quantity: 1,
+    itemId: 'scrapbook',
+    itemName: 'Momoto scrapbook',
+    returnPath: `/scrapbook/${scrapbookId}`,
+    customer: { name: user?.displayName ?? 'Momoto user', email: user?.email ?? null },
+    method,
+  })
+
+  const recorded = await prisma.$transaction(async (tx) => {
+    await lockScrapbook(tx, scrapbookId)
+    const still = await findPurchasableScrapbook(userId, scrapbookId, tx)
+    if (!still.ok) return { ok: false as const, refusal: still }
+    // A second tab that charged the same scrapbook a moment ago got here first.
+    if (await hasLivePayment(scrapbookId, tx)) {
+      return { ok: false as const, refusal: { status: 409, error: 'payment_in_progress' } }
+    }
+    const payment = await tx.payment.create({
+      data: {
+        orderId,
+        userId,
+        grossAmount: price,
+        paymentType: method,
+        qrImageUrl: charge.qrImageUrl,
+        deeplinkUrl: charge.deeplinkUrl,
+        expiresAt: charge.expiresAt,
+        midtransStatus: charge.transactionStatus,
+        scrapbooks: { connect: { id: scrapbookId } },
+      },
+      select: PAYMENT_SELECT,
+    })
+    return { ok: true as const, payment }
+  })
+
+  if (!recorded.ok) {
+    try {
+      await cancelTransaction(orderId)
+    } catch (error) {
+      // Unrecorded and never shown, so it can't be paid; it expires on its own.
+      logger.warn('payments.charge.cancelFailed', { orderId, err: String(error) })
+    }
+    logger.info('payments.charge.abandoned', { userId, orderId, error: recorded.refusal.error })
+    res.status(recorded.refusal.status).json({ error: recorded.refusal.error })
+    return
+  }
+  logger.info('payments.charge.created', {
+    userId,
+    orderId,
+    method,
+    scrapbookId,
+    grossAmount: price,
+  })
+  res.status(201).json(serializePayment(recorded.payment))
+}
 
 // ── GET /payments/pending ─── resume an attempt the user walked away from ────
 /**
@@ -256,7 +386,8 @@ function mapStatus(transactionStatus: string, fraudStatus?: string): string | nu
  * Midtrans calls this on every status change. **Unauthenticated but
  * signature-verified** — anyone can POST here, but only Midtrans can produce the
  * signature. Idempotent: replays and already-settled orders are no-ops. This is the
- * only thing that flips `Strip.paid`; the client callback is never trusted.
+ * only thing that flips `Strip.paid` and `Scrapbook.paid` for money (the free unlocks
+ * flip them only while payments are off); the client callback is never trusted.
  */
 paymentsRouter.post(
   '/midtrans/notification',
@@ -285,7 +416,7 @@ paymentsRouter.post(
 
     const payment = await prisma.payment.findUnique({
       where: { orderId },
-      include: { strips: { select: { id: true } } },
+      include: { strips: { select: { id: true } }, scrapbooks: { select: { id: true } } },
     })
     if (!payment) {
       // Unknown order — ack so Midtrans stops retrying, but do nothing.
@@ -329,7 +460,11 @@ paymentsRouter.post(
           settling: stripIds.length,
         })
       }
-      // Flip the payment and unlock every strip it covers in one transaction.
+      const scrapbookIds = payment.scrapbooks.map((s) => s.id)
+      // Flip the payment and unlock everything it covers in one transaction. A scrapbook
+      // under a live payment can't have been reopened or deleted (both refuse under its row
+      // lock), so it is still finished with its PDF; only account deletion removes it, and
+      // then there is nothing left to flip.
       await prisma.$transaction([
         prisma.payment.update({
           where: { orderId },
@@ -339,8 +474,16 @@ paymentsRouter.post(
           where: { id: { in: stripIds } },
           data: { paid: true, paidAt: now },
         }),
+        prisma.scrapbook.updateMany({
+          where: { id: { in: scrapbookIds } },
+          data: { paid: true, paidAt: now },
+        }),
       ])
-      logger.info('payments.paid', { orderId, strips: stripIds.length })
+      logger.info('payments.paid', {
+        orderId,
+        strips: stripIds.length,
+        scrapbooks: scrapbookIds.length,
+      })
     } else {
       await prisma.payment.update({
         where: { orderId },
@@ -392,6 +535,9 @@ paymentsRouter.get(
           // storage URLs here. Deleting a strip drops the join row, so this is "what
           // this order bought that you still have" — which is also what the row shows.
           strips: { select: { id: true } },
+          // Unlike strips, the client keeps no store of scrapbooks to draw these from, so
+          // the order carries what its row shows: the title and the cover.
+          scrapbooks: { select: { id: true, title: true, coverKey: true } },
         },
       }),
       prisma.payment.aggregate({
@@ -407,6 +553,12 @@ paymentsRouter.get(
         currency: row.currency,
         status: row.status,
         stripIds: row.strips.map((strip) => strip.id),
+        // A removed scrapbook keeps its row (and this join), with no cover left to show.
+        scrapbooks: row.scrapbooks.map((scrapbook) => ({
+          id: scrapbook.id,
+          title: scrapbook.title,
+          coverUrl: coverUrlOf(scrapbook),
+        })),
         createdAt: row.createdAt.toISOString(),
         paidAt: row.paidAt?.toISOString() ?? null,
       })),

@@ -132,6 +132,17 @@ export function stripKey(
   return `${prefix}/${crypto.randomUUID()}.${extension}`
 }
 
+/**
+ * A storage key for one scrapbook object: the finished PDF (private bucket) or its cover
+ * preview (public bucket). Random for the same reasons as `stripKey`; a re-finish after a
+ * reopen always gets new keys, so nothing cached under an old one can resurface.
+ */
+export function scrapbookKey(kind: 'pdf' | 'cover', coverType: string = 'image/webp'): string {
+  return kind === 'pdf'
+    ? `scrapbooks/${crypto.randomUUID()}.pdf`
+    : `scrapbook-covers/${crypto.randomUUID()}.${IMAGE_EXTENSIONS[coverType] ?? 'webp'}`
+}
+
 /** Extension for each format `sniffImageType` accepts. Shared by strips and avatars. */
 const IMAGE_EXTENSIONS: Record<string, string> = {
   'image/webp': 'webp',
