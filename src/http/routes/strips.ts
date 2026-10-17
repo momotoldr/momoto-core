@@ -292,14 +292,15 @@ export function serializeStrip(strip: SerializableStrip) {
  * Counted in memory rather than with two `prisma.count` queries: the listing loads every
  * one of the user's strips anyway, so the meter is free here and a round trip there.
  *
- * The two buckets are independent on purpose. `cart` counts unpaid strips (what
- * `POST /strips` refuses at), `gallery` counts paid ones (what an unlock refuses at) —
- * a full gallery must never stop someone saving a new capture.
+ * The two buckets are independent on purpose. `cart` counts unpaid strips plus the
+ * finished scrapbooks waiting there (what `POST /strips` and a scrapbook finish refuse
+ * at), `gallery` counts paid strips (what an unlock refuses at) — a full gallery must
+ * never stop someone saving a new capture.
  */
-function quotaFor(strips: { paid: boolean }[]) {
+function quotaFor(strips: { paid: boolean }[], scrapbooks: number) {
   const galleryUsed = strips.reduce((total, strip) => total + (strip.paid ? 1 : 0), 0)
   return {
-    cart: { used: strips.length - galleryUsed, limit: env.stripMaxItems },
+    cart: { used: strips.length - galleryUsed + scrapbooks, limit: env.stripMaxItems },
     gallery: { used: galleryUsed, limit: env.galleryMaxItems },
   }
 }
@@ -573,17 +574,32 @@ async function answerReplay(res: Response, userId: string, clientKey: string | n
 }
 
 /**
- * Whether the cart is already at its cap.
+ * Finished, unpaid scrapbooks. They wait in the cart to be paid for, and each takes one
+ * of its slots like a strip (user decision, 2026-10-17). A draft isn't in the cart yet; a
+ * paid one has left it.
+ */
+export function scrapbooksInCart(userId: string): Promise<number> {
+  return prisma.scrapbook.count({
+    where: { userId, removedAt: null, paid: false, finishedAt: { not: null } },
+  })
+}
+
+/**
+ * Whether the cart is already at its cap (`STRIP_MAX_ITEMS`, which caps the whole cart:
+ * unpaid strips and finished scrapbooks together).
  *
  * Checked *before* anything is written to a bucket: rejecting after the upload would
- * leave objects in R2 that no row names. Only unpaid strips count — a strip someone paid
+ * leave objects in R2 that no row names. Only unpaid items count — a strip someone paid
  * for is theirs to keep, and shouldn't stop them making another. Two tabs racing can land
  * at cap + 1; that's accepted rather than paying for a serializable transaction.
  */
-async function cartIsFull(userId: string): Promise<boolean> {
-  const unpaid = await prisma.strip.count({ where: { userId, paid: false } })
-  if (unpaid < env.stripMaxItems) return false
-  logger.info('strips.cartFull', { userId, unpaid, limit: env.stripMaxItems })
+export async function cartIsFull(userId: string): Promise<boolean> {
+  const [strips, scrapbooks] = await Promise.all([
+    prisma.strip.count({ where: { userId, paid: false } }),
+    scrapbooksInCart(userId),
+  ])
+  if (strips + scrapbooks < env.stripMaxItems) return false
+  logger.info('strips.cartFull', { userId, strips, scrapbooks, limit: env.stripMaxItems })
   return true
 }
 
@@ -1192,11 +1208,14 @@ export function sweepRemoveLimits(now: number = Date.now()): number {
 
 /** The user's live strips' quota, for a response that has just changed it. */
 async function currentQuota(userId: string) {
-  const strips = await prisma.strip.findMany({
-    where: { userId, removedAt: null },
-    select: { paid: true },
-  })
-  return quotaFor(strips)
+  const [strips, scrapbooks] = await Promise.all([
+    prisma.strip.findMany({
+      where: { userId, removedAt: null },
+      select: { paid: true },
+    }),
+    scrapbooksInCart(userId),
+  ])
+  return quotaFor(strips, scrapbooks)
 }
 
 // ── POST /strips/:id/remove ─── take an unlocked strip out of the gallery ────
@@ -1280,17 +1299,20 @@ stripsRouter.get(
   requireAuth,
   asyncRoute(async (req, res) => {
     const userId = req.userId as string
-    const strips = await prisma.strip.findMany({
-      // Removed strips have no images left to show, and the client never needs them:
-      // the purchase history still names them through the payment, and draws a
-      // placeholder for an id the cart doesn't hold.
-      where: { userId, removedAt: null },
-      orderBy: { createdAt: 'desc' },
-      // Never load the bytes for a listing — the metadata + image URL is all the cart
-      // needs, and the bytes are large.
-      select: stripSummarySelect,
-    })
-    res.json({ strips: strips.map(serializeStrip), quota: quotaFor(strips) })
+    const [strips, scrapbooks] = await Promise.all([
+      prisma.strip.findMany({
+        // Removed strips have no images left to show, and the client never needs them:
+        // the purchase history still names them through the payment, and draws a
+        // placeholder for an id the cart doesn't hold.
+        where: { userId, removedAt: null },
+        orderBy: { createdAt: 'desc' },
+        // Never load the bytes for a listing — the metadata + image URL is all the cart
+        // needs, and the bytes are large.
+        select: stripSummarySelect,
+      }),
+      scrapbooksInCart(userId),
+    ])
+    res.json({ strips: strips.map(serializeStrip), quota: quotaFor(strips, scrapbooks) })
   }),
 )
 

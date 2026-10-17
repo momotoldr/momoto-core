@@ -40,19 +40,21 @@ export function isPaymentMethod(value: unknown): value is PaymentMethod {
   return typeof value === 'string' && (PAYMENT_METHODS as readonly string[]).includes(value)
 }
 
+/** One line on the Midtrans receipt: strips at their price, scrapbooks at theirs. */
+export interface ChargeItem {
+  /** The line item's id: `strip-print` or `scrapbook`. */
+  id: string
+  name: string
+  /** Price per item, in whole rupiah. */
+  price: number
+  quantity: number
+}
+
 export interface ChargeOrder {
   orderId: string
-  /** Price per item, in whole rupiah. */
-  unitPrice: number
-  /** How many items this checkout unlocks: strips, or 1 for a scrapbook. */
-  quantity: number
-  /** The line item's id on the Midtrans receipt: `strip-print` or `scrapbook`. */
-  itemId: string
-  itemName: string
-  /**
-   * App path a wallet returns the buyer to (ShopeePay's `callback_url`): the cart for
-   * strips, the scrapbook itself for a scrapbook.
-   */
+  /** At least one line; empty lines (quantity 0) are left off. */
+  items: ChargeItem[]
+  /** App path a wallet returns the buyer to (ShopeePay's `callback_url`): the cart. */
   returnPath: string
   customer: { name: string; email: string | null }
   method: PaymentMethod
@@ -111,16 +113,24 @@ function channelParams(method: PaymentMethod, returnPath: string): Record<string
   }
 }
 
+/** What a set of lines adds up to — the order's `gross_amount`. */
+export function chargeTotal(items: ChargeItem[]): number {
+  return items.reduce((total, item) => total + item.price * item.quantity, 0)
+}
+
 /** Open a transaction on one channel and return what the client needs to render. */
 export async function chargeTransaction(order: ChargeOrder): Promise<ChargeResult> {
-  // gross_amount must equal Σ(price × quantity); one line item (quantity = #strips, or 1).
-  const grossAmount = order.unitPrice * order.quantity
+  // gross_amount must equal Σ(price × quantity) over the lines, or Midtrans refuses it.
+  const items = order.items.filter((item) => item.quantity > 0)
   const response = (await getCore().charge({
     payment_type: order.method,
-    transaction_details: { order_id: order.orderId, gross_amount: grossAmount },
-    item_details: [
-      { id: order.itemId, price: order.unitPrice, quantity: order.quantity, name: order.itemName },
-    ],
+    transaction_details: { order_id: order.orderId, gross_amount: chargeTotal(items) },
+    item_details: items.map((item) => ({
+      id: item.id,
+      price: item.price,
+      quantity: item.quantity,
+      name: item.name,
+    })),
     customer_details: {
       first_name: order.customer.name,
       ...(order.customer.email ? { email: order.customer.email } : {}),

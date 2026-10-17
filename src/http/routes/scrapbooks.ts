@@ -22,7 +22,13 @@ import { signUploadGrant, verifyUploadGrant } from '../../storage/uploadGrant.js
 import { asyncRoute } from '../asyncRoute.js'
 import { readImageSize, sniffImageType } from '../imageType.js'
 import { requireAuth } from '../middleware/requireAuth.js'
-import { readDeclaredFile, serializeStrip, serveImage, stripSummarySelect } from './strips.js'
+import {
+  cartIsFull,
+  readDeclaredFile,
+  serializeStrip,
+  serveImage,
+  stripSummarySelect,
+} from './strips.js'
 
 /**
  * Scrapbooks: a fixed template filled with the owner's unlocked strips and their own text,
@@ -491,6 +497,13 @@ async function findFinishable(
     // Also what a retry sees after a finish that landed but whose answer was lost — the
     // client reads the state on this and treats `finished` as its success (plan §2b).
     res.status(409).json({ error: 'scrapbook_locked' })
+    return null
+  }
+  // Finishing puts it in the cart, where it takes a slot like a strip (2026-10-17). Checked
+  // at every step of a finish, before anything is promoted, so a cart that filled up
+  // between start and complete still refuses — the uploads left in `incoming/` expire.
+  if (await cartIsFull(userId)) {
+    res.status(409).json({ error: 'cart_full' })
     return null
   }
   return row
