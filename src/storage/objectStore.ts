@@ -40,7 +40,7 @@ import { logger } from '../lib/logger.js'
  * what it does until `R2_AVATAR_BUCKET` is set — so this names the *role*, and env.ts
  * decides which actual bucket each role lands on.
  */
-export type Bucket = 'public' | 'private' | 'avatar'
+export type Bucket = 'public' | 'private' | 'avatar' | 'scrapbook'
 
 const client: S3Client | null = env.r2
   ? new S3Client({
@@ -82,6 +82,9 @@ const signingClient: S3Client | null = env.r2
 /** True when R2 is configured and new uploads should go there. */
 export const storageEnabled = client !== null
 
+/** True when R2 is configured *and* scrapbooks have their bucket (`R2_SCRAPBOOK_BUCKET`). */
+export const scrapbookStorageEnabled = client !== null && !!env.r2?.scrapbookBucket
+
 /** Resolve a role to the bucket it lives in and the origin it's served from. */
 function bucketConfig(bucket: Bucket): { name: string; publicBaseUrl: string | null } {
   const r2 = env.r2
@@ -95,6 +98,11 @@ function bucketConfig(bucket: Bucket): { name: string; publicBaseUrl: string | n
       // Never has a public origin, whatever is configured — this is the paid copy,
       // and it is only ever handed out through the auth + payment gate.
       return { name: r2.printBucket, publicBaseUrl: null }
+    case 'scrapbook':
+      // Private too: PDFs are paid, and covers go out through signed URLs. Callers check
+      // `scrapbookStorageEnabled` first; reaching here without it is a programming error.
+      if (!r2.scrapbookBucket) throw new Error('R2_SCRAPBOOK_BUCKET is not configured')
+      return { name: r2.scrapbookBucket, publicBaseUrl: null }
   }
 }
 
@@ -133,14 +141,15 @@ export function stripKey(
 }
 
 /**
- * A storage key for one scrapbook object: the finished PDF (private bucket) or its cover
- * preview (public bucket). Random for the same reasons as `stripKey`; a re-finish after a
- * reopen always gets new keys, so nothing cached under an old one can resurface.
+ * A storage key for one scrapbook object, in the scrapbook bucket: the finished PDF or its
+ * cover preview. Random for the same reasons as `stripKey`; a re-finish after a reopen
+ * always gets new keys, so nothing cached under an old one can resurface.
  */
 export function scrapbookKey(kind: 'pdf' | 'cover', coverType: string = 'image/webp'): string {
+  // Plain prefixes: these live in the scrapbook bucket, next to nothing but each other.
   return kind === 'pdf'
-    ? `scrapbooks/${crypto.randomUUID()}.pdf`
-    : `scrapbook-covers/${crypto.randomUUID()}.${IMAGE_EXTENSIONS[coverType] ?? 'webp'}`
+    ? `pdfs/${crypto.randomUUID()}.pdf`
+    : `covers/${crypto.randomUUID()}.${IMAGE_EXTENSIONS[coverType] ?? 'webp'}`
 }
 
 /** Extension for each format `sniffImageType` accepts. Shared by strips and avatars. */
@@ -234,20 +243,48 @@ export async function presignedGetUrl(
   key: string,
   response: { filename: string; contentType: string },
 ): Promise<{ url: string; expiresAt: Date }> {
+  return signGet(bucket, key, PRESIGNED_GET_TTL_SECONDS, {
+    ResponseContentType: response.contentType,
+    ResponseContentDisposition: `attachment; filename="${response.filename}"`,
+    // The stored object says `public, immutable` (see `putImage`); the paid copy must
+    // not be kept by anything between R2 and the browser.
+    ResponseCacheControl: 'private, no-store',
+  })
+}
+
+/**
+ * A signed URL to *show* an image from a private bucket in an `<img>` — a scrapbook's
+ * cover, which has no public origin. Unlike `presignedGetUrl` it is inline and may be
+ * cached by the browser for as long as the URL itself is good; the image isn't paid
+ * content, only private storage.
+ */
+export async function presignedImageUrl(
+  bucket: Bucket,
+  key: string,
+  contentType: string,
+  ttlSeconds: number,
+): Promise<{ url: string; expiresAt: Date }> {
+  return signGet(bucket, key, ttlSeconds, {
+    ResponseContentType: contentType,
+    ResponseCacheControl: `private, max-age=${ttlSeconds}`,
+  })
+}
+
+async function signGet(
+  bucket: Bucket,
+  key: string,
+  ttlSeconds: number,
+  overrides: Pick<
+    ConstructorParameters<typeof GetObjectCommand>[0],
+    'ResponseContentType' | 'ResponseContentDisposition' | 'ResponseCacheControl'
+  >,
+): Promise<{ url: string; expiresAt: Date }> {
   if (!signingClient) throw new Error('Object storage is not configured')
-  const expiresAt = new Date(Date.now() + PRESIGNED_GET_TTL_SECONDS * 1000)
+  const expiresAt = new Date(Date.now() + ttlSeconds * 1000)
   const url = await getSignedUrl(
     signingClient,
-    new GetObjectCommand({
-      Bucket: bucketName(bucket),
-      Key: key,
-      ResponseContentType: response.contentType,
-      ResponseContentDisposition: `attachment; filename="${response.filename}"`,
-      // The stored object says `public, immutable` (see `putImage`); the paid copy must
-      // not be kept by anything between R2 and the browser.
-      ResponseCacheControl: 'private, no-store',
-    }),
-    { expiresIn: PRESIGNED_GET_TTL_SECONDS },
+    new GetObjectCommand({ Bucket: bucketName(bucket), Key: key, ...overrides }),
+    { expiresIn: ttlSeconds },
   )
   return { url, expiresAt }
 }
@@ -357,9 +394,12 @@ export async function promoteObject(
   to: Bucket,
   toKey: string,
   mimeType: string,
+  /** Where the upload landed. Strips and avatars use the shared upload bucket; a
+   * scrapbook uploads into its own bucket's `incoming/` and is promoted within it. */
+  from: Bucket = UPLOAD_BUCKET,
 ): Promise<void> {
   if (!client) throw new Error('Object storage is not configured')
-  const source = bucketName(UPLOAD_BUCKET)
+  const source = bucketName(from)
   await client.send(
     new CopyObjectCommand({
       Bucket: bucketName(to),

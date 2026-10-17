@@ -11,23 +11,18 @@ import {
   presignedGetUrl,
   presignedPutUrl,
   promoteObject,
-  publicUrl,
+  presignedImageUrl,
   putImage,
   readObject,
   scrapbookKey,
-  UPLOAD_BUCKET,
+  scrapbookStorageEnabled,
+  type Bucket,
 } from '../../storage/objectStore.js'
 import { signUploadGrant, verifyUploadGrant } from '../../storage/uploadGrant.js'
 import { asyncRoute } from '../asyncRoute.js'
 import { readImageSize, sniffImageType } from '../imageType.js'
 import { requireAuth } from '../middleware/requireAuth.js'
-import {
-  readDeclaredFile,
-  requireStorage,
-  serializeStrip,
-  serveImage,
-  stripSummarySelect,
-} from './strips.js'
+import { readDeclaredFile, serializeStrip, serveImage, stripSummarySelect } from './strips.js'
 
 /**
  * Scrapbooks: a fixed template filled with the owner's unlocked strips and their own text,
@@ -38,6 +33,32 @@ import {
  * whose clean copy the client composes and this server only keeps and hands out.
  */
 export const scrapbooksRouter = Router()
+
+/**
+ * Where everything a scrapbook stores lives — PDFs, covers and its own `incoming/` uploads
+ * — apart from the strip and avatar buckets (user decision, 2026-10-17). Private: PDFs go
+ * out through the paid gate, covers through short-lived signed URLs.
+ */
+const BUCKET: Bucket = 'scrapbook'
+
+/**
+ * Guard the routes that touch scrapbook objects when `R2_SCRAPBOOK_BUCKET` isn't set.
+ * 503 rather than 500, and the rest of the API — drafts included — keeps working; only
+ * finishing, the PDF and covers need the bucket.
+ */
+function requireScrapbookStorage(res: Response): boolean {
+  if (scrapbookStorageEnabled) return true
+  logger.error('scrapbooks.storageUnavailable', {
+    msg: 'R2_SCRAPBOOK_BUCKET is not configured; scrapbooks cannot be finished or served.',
+  })
+  res.status(503).json({ error: 'storage_unavailable' })
+  return false
+}
+
+/** How long a cover's signed URL is good for, and how long the redirect to it is cached —
+ * half as long, so a cached redirect never points at an expired URL. */
+const COVER_URL_TTL_SECONDS = 10 * 60
+const COVER_REDIRECT_MAX_AGE = COVER_URL_TTL_SECONDS / 2
 
 // ── Limits ───────────────────────────────────────────────────────────────────
 
@@ -136,7 +157,11 @@ function stripIdsOf(content: ScrapbookContent): string[] {
  */
 export function coverUrlOf(row: { id: string; coverKey: string | null }): string | null {
   if (!row.coverKey) return null
-  return publicUrl('public', row.coverKey) ?? `/scrapbooks/${row.id}/cover`
+  // Always the API route, which redirects to a signed URL — the bucket has no public
+  // origin. `v` is the key's own UUID, so a re-finish (new key) is a new URL and no cached
+  // redirect can show the old cover.
+  const version = row.coverKey.slice(row.coverKey.lastIndexOf('/') + 1).split('.')[0]
+  return `/scrapbooks/${row.id}/cover?v=${version}`
 }
 
 /** One scrapbook for the shelf: no content, just enough to draw a cover and a state tape. */
@@ -340,7 +365,7 @@ export async function deleteScrapbookObjects(
 ): Promise<void> {
   const pdfKeys = rows.map((row) => row.pdfKey).filter((key): key is string => !!key)
   const coverKeys = rows.map((row) => row.coverKey).filter((key): key is string => !!key)
-  await Promise.all([deleteImages('private', pdfKeys), deleteImages('public', coverKeys)])
+  await deleteImages(BUCKET, [...pdfKeys, ...coverKeys])
 }
 
 /**
@@ -629,7 +654,7 @@ scrapbooksRouter.post(
   asyncRoute(async (req, res) => {
     const userId = req.userId as string
     const scrapbookId = req.params.id as string
-    if (!requireStorage(res)) return
+    if (!requireScrapbookStorage(res)) return
     if (!finishLimiter.allow(userId)) {
       res.status(429).json({ error: 'too_many_requests' })
       return
@@ -657,7 +682,7 @@ scrapbooksRouter.post(
       cover: { key: incomingKey(), ...cover },
     }
     const presign = (file: { key: string; contentType: string; size: number }) =>
-      presignedPutUrl(UPLOAD_BUCKET, file.key, {
+      presignedPutUrl(BUCKET, file.key, {
         contentType: file.contentType,
         contentLength: file.size,
       }).then((url) => ({ url, contentType: file.contentType }))
@@ -692,7 +717,7 @@ scrapbooksRouter.post(
   asyncRoute(async (req, res) => {
     const userId = req.userId as string
     const scrapbookId = req.params.id as string
-    if (!requireStorage(res)) return
+    if (!requireScrapbookStorage(res)) return
     const grant = verifyUploadGrant(
       (req.body as { token?: unknown } | undefined)?.token,
       'scrapbook',
@@ -703,7 +728,7 @@ scrapbooksRouter.post(
       return
     }
     // Best-effort, like every delete: the lifecycle rule on `incoming/` is the backstop.
-    const dropIncoming = () => deleteImages(UPLOAD_BUCKET, [grant.pdf.key, grant.cover.key])
+    const dropIncoming = () => deleteImages(BUCKET, [grant.pdf.key, grant.cover.key])
 
     const row = await findFinishable(res, userId, scrapbookId)
     if (!row) {
@@ -720,8 +745,8 @@ scrapbooksRouter.post(
     }
 
     const [pdf, cover] = await Promise.all([
-      readObject(UPLOAD_BUCKET, grant.pdf.key, env.scrapbookPdfMaxBytes),
-      readObject(UPLOAD_BUCKET, grant.cover.key, COVER_BOUNDS.maxBytes),
+      readObject(BUCKET, grant.pdf.key, env.scrapbookPdfMaxBytes),
+      readObject(BUCKET, grant.cover.key, COVER_BOUNDS.maxBytes),
     ])
     if (!pdf || !cover) {
       res.status(409).json({ error: 'upload_incomplete' })
@@ -742,8 +767,8 @@ scrapbooksRouter.post(
     }
     try {
       await Promise.all([
-        promoteObject(grant.pdf.key, 'private', stored.pdfKey, PDF_MIME),
-        promoteObject(grant.cover.key, 'public', stored.coverKey, checked.coverType),
+        promoteObject(grant.pdf.key, BUCKET, stored.pdfKey, PDF_MIME, BUCKET),
+        promoteObject(grant.cover.key, BUCKET, stored.coverKey, checked.coverType, BUCKET),
       ])
     } catch (error) {
       // One copy may have landed; with no row naming it, it is an orphan unless dropped.
@@ -794,7 +819,7 @@ scrapbooksRouter.post(
   asyncRoute(async (req, res) => {
     const userId = req.userId as string
     const scrapbookId = req.params.id as string
-    if (!requireStorage(res)) return
+    if (!requireScrapbookStorage(res)) return
     if (!finishLimiter.allow(userId)) {
       res.status(429).json({ error: 'too_many_requests' })
       return
@@ -831,8 +856,8 @@ scrapbooksRouter.post(
     }
     try {
       await Promise.all([
-        putImage('private', stored.pdfKey, files.pdf, PDF_MIME),
-        putImage('public', stored.coverKey, files.cover, checked.coverType),
+        putImage(BUCKET, stored.pdfKey, files.pdf, PDF_MIME),
+        putImage(BUCKET, stored.coverKey, files.cover, checked.coverType),
       ])
     } catch (error) {
       await deleteScrapbookObjects([stored])
@@ -1109,7 +1134,7 @@ scrapbooksRouter.get(
   asyncRoute(async (req, res) => {
     const pdf = await authorizePdf(req, res)
     if (!pdf) return
-    const { url, expiresAt } = await presignedGetUrl('private', pdf.key, {
+    const { url, expiresAt } = await presignedGetUrl(BUCKET, pdf.key, {
       filename: pdf.filename,
       contentType: PDF_MIME,
     })
@@ -1130,28 +1155,38 @@ scrapbooksRouter.get(
     res.setHeader('Content-Disposition', `attachment; filename="${pdf.filename}"`)
     res.setHeader('Cache-Control', 'private, no-store')
     res.setHeader('X-Content-Type-Options', 'nosniff')
-    if (!(await serveImage(res, 'private', pdf.key))) notFound(res)
+    if (!(await serveImage(res, BUCKET, pdf.key))) notFound(res)
   }),
 )
 
-// ── GET /scrapbooks/:id/cover ─── the cover preview, when there's no CDN ─────
+// ── GET /scrapbooks/:id/cover ─── the cover preview, via a signed URL ────────
 /**
- * Only reached when the public bucket has no origin (local dev): `coverUrl` is the CDN
- * URL otherwise. **Unauthenticated**, like a strip's thumbnail — it goes in an `<img>`,
- * which can't carry a token, and the id is an unguessable cuid.
+ * Every cover URL points here: the scrapbook bucket is private, so this answers with a
+ * redirect to a short-lived signed URL rather than streaming the bytes — R2 serves them,
+ * and they cost no Railway egress. The redirect is cached for half the URL's life, so a
+ * cached redirect never lands on an expired URL; the `v` the cover URL carries changes
+ * with every finish, so a new cover is never hidden behind an old redirect.
+ *
+ * **Unauthenticated**, like a strip's thumbnail — it goes in an `<img>`, which can't carry
+ * a token, and the id is an unguessable cuid. A cover is a preview of the owner's own
+ * page, not the paid file.
  */
 scrapbooksRouter.get(
   '/:id/cover',
   asyncRoute(async (req, res) => {
+    if (!scrapbookStorageEnabled) return notFound(res)
     const row = await prisma.scrapbook.findFirst({
       where: { id: req.params.id as string, removedAt: null },
       select: { coverKey: true },
     })
     if (!row?.coverKey) return notFound(res)
-    res.setHeader('Content-Type', row.coverKey.endsWith('.jpg') ? 'image/jpeg' : 'image/webp')
-    // Short: a reopen and re-finish replaces the cover under the same URL.
-    res.setHeader('Cache-Control', 'public, max-age=60')
-    res.setHeader('X-Content-Type-Options', 'nosniff')
-    if (!(await serveImage(res, 'public', row.coverKey))) notFound(res)
+    const { url } = await presignedImageUrl(
+      BUCKET,
+      row.coverKey,
+      row.coverKey.endsWith('.jpg') ? 'image/jpeg' : 'image/webp',
+      COVER_URL_TTL_SECONDS,
+    )
+    res.setHeader('Cache-Control', `private, max-age=${COVER_REDIRECT_MAX_AGE}`)
+    res.redirect(302, url)
   }),
 )

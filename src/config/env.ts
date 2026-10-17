@@ -162,6 +162,17 @@ export interface R2Config {
    * bucket through `GET /avatars/:userId` instead of off the edge.
    */
   avatarPublicBaseUrl: string | null
+  /**
+   * Bucket holding everything a scrapbook stores — the finished PDFs, their covers, and
+   * the scrapbook's own `incoming/` uploads (docs/PLAN-scrapbook.md). **Private**, like
+   * the print bucket: covers reach the browser through signed URLs, never a public origin.
+   *
+   * Null when unset, which is not a boot error: scrapbook storage then answers
+   * `503 storage_unavailable` and the rest of the API is unaffected. Never defaulted to
+   * another bucket — scrapbooks were moved out of the strip buckets on purpose (user
+   * decision, 2026-10-17), and a missing variable must not quietly put them back.
+   */
+  scrapbookBucket: string | null
 }
 
 /** Connection to the notification service. */
@@ -282,6 +293,15 @@ function parseR2(): R2Config | null {
     throw new Error('R2_AVATAR_BUCKET must not be R2_PRINT_BUCKET: avatars are public.')
   }
 
+  const scrapbookBucket = process.env.R2_SCRAPBOOK_BUCKET?.trim() || null
+  // Its own bucket or nothing: sharing one would mix scrapbook objects (and its
+  // `incoming/` lifecycle rule) back into a strip or avatar bucket.
+  if (scrapbookBucket && [bucket, printBucket || bucket, avatarBucket].includes(scrapbookBucket)) {
+    throw new Error(
+      'R2_SCRAPBOOK_BUCKET must be its own bucket, not R2_BUCKET, R2_PRINT_BUCKET or R2_AVATAR_BUCKET.',
+    )
+  }
+
   return {
     endpoint: process.env.R2_ENDPOINT?.trim() || `https://${accountId}.r2.cloudflarestorage.com`,
     accessKeyId: requiredSecret('R2_ACCESS_KEY_ID', process.env.R2_ACCESS_KEY_ID),
@@ -291,6 +311,7 @@ function parseR2(): R2Config | null {
     avatarBucket,
     publicBaseUrl,
     avatarPublicBaseUrl,
+    scrapbookBucket,
   }
 }
 
