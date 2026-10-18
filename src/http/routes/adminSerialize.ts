@@ -97,7 +97,7 @@ export interface AdminPaymentInput {
   paidAt: Date | null
   /** Null once the payer deleted their account (the payment is kept). */
   user: UserSummaryInput | null
-  _count: { strips: number }
+  _count: { strips: number; scrapbooks: number }
 }
 
 /** A payment row for the admin transactions table. */
@@ -110,6 +110,8 @@ export function serializeAdminPayment(p: AdminPaymentInput) {
     status: p.status,
     midtransStatus: p.midtransStatus,
     stripCount: p._count.strips,
+    // Non-zero for a scrapbook order (then `stripCount` is 0): the portal's item column.
+    scrapbookCount: p._count.scrapbooks,
     user: p.user ? serializeUserSummary(p.user) : null,
     createdAt: p.createdAt.toISOString(),
     paidAt: p.paidAt ? p.paidAt.toISOString() : null,

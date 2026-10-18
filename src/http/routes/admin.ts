@@ -36,6 +36,7 @@ import {
   serializeAdminUser,
   serializeUserSummary,
 } from './adminSerialize.js'
+import { deleteScrapbookObjects, scrapbookObjectsOf } from './scrapbooks.js'
 import { deleteStripObjects } from './strips.js'
 
 /** Session modes the app records — the single list every mode filter reads. */
@@ -130,19 +131,34 @@ async function withUserCount<T extends { id: string }>(user: T) {
   return counted!
 }
 
-/** Attach each payment's strip count, as `serializeAdminPayment` reads it. */
+/**
+ * Attach each payment's strip and scrapbook counts, as `serializeAdminPayment` reads them.
+ * A payment holds strips or one scrapbook, so exactly one of the two is non-zero.
+ */
 async function withStripCounts<T extends { id: string }>(
   payments: T[],
-): Promise<(T & { _count: { strips: number } })[]> {
+): Promise<(T & { _count: { strips: number; scrapbooks: number } })[]> {
   const ids = payments.map((p) => p.id)
   // Implicit many-to-many: "A" is the Payment id, led by the (A, B) primary key.
-  const rows = ids.length
-    ? await prisma.$queryRaw<{ paymentId: string; n: number }[]>`
-        SELECT "A" AS "paymentId", count(*)::int AS n
-        FROM "_PaymentToStrip" WHERE "A" = ANY(${ids}) GROUP BY "A"`
-    : []
-  const counts = new Map(rows.map((r) => [r.paymentId, r.n]))
-  return payments.map((p) => ({ ...p, _count: { strips: counts.get(p.id) ?? 0 } }))
+  const [strips, scrapbooks] = ids.length
+    ? await Promise.all([
+        prisma.$queryRaw<{ paymentId: string; n: number }[]>`
+          SELECT "A" AS "paymentId", count(*)::int AS n
+          FROM "_PaymentToStrip" WHERE "A" = ANY(${ids}) GROUP BY "A"`,
+        prisma.$queryRaw<{ paymentId: string; n: number }[]>`
+          SELECT "A" AS "paymentId", count(*)::int AS n
+          FROM "_PaymentToScrapbook" WHERE "A" = ANY(${ids}) GROUP BY "A"`,
+      ])
+    : [[], []]
+  const stripCounts = new Map(strips.map((r) => [r.paymentId, r.n]))
+  const scrapbookCounts = new Map(scrapbooks.map((r) => [r.paymentId, r.n]))
+  return payments.map((p) => ({
+    ...p,
+    _count: {
+      strips: stripCounts.get(p.id) ?? 0,
+      scrapbooks: scrapbookCounts.get(p.id) ?? 0,
+    },
+  }))
 }
 
 /** The embedded "who" reference on a payment/feedback/strip/session row. */
@@ -694,11 +710,13 @@ adminRouter.delete(
         printImage: { select: { storageKey: true } },
       },
     })
+    const scrapbooks = await scrapbookObjectsOf(target.id)
 
     await prisma.user.delete({ where: { id } })
     // Their testimonials cascaded away (or dropped them as a partner) — refresh the landing cache.
     markTestimonialsChanged()
     await deleteStripObjects(strips)
+    await deleteScrapbookObjects(scrapbooks)
     if (target.avatarKey) await deleteImages('avatar', [target.avatarKey])
     logger.info('admin.user.deleted', { by: req.userId, userId: id })
     res.json({ ok: true })

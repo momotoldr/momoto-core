@@ -94,6 +94,7 @@ model User {
   partnerInvites     PartnerInvite[]          @relation("Inviter")
   avatarImage        AvatarImage?
   strips             Strip[]
+  scrapbooks         Scrapbook[]
   payments           Payment[]
   feedbacks          Feedback[]               @relation("FeedbackAuthor")
   supportTickets     SupportTicket[]          @relation("SupportTicketAuthor")
@@ -347,6 +348,56 @@ model Strip {
   @@index([sessionId, createdAt])
 }
 
+/// A scrapbook: a fixed template (the FE's `scrapbookTemplates.ts`) filled with the
+/// owner's unlocked strips and their own text, finished into a PDF and sold as one.
+///
+/// `content` is the layout only — `{ strips: { [slotId]: stripId }, texts: { [textId]:
+/// string } }` — never pixels: strips are referenced by id and drawn from their own
+/// objects. Slot ids belong to the template manifest, which is why this is JSON and not a
+/// join table (docs/PLAN-scrapbook.md §1).
+///
+/// Lifecycle, derived from the columns rather than stored:
+///   draft    — `finishedAt` null; editable.
+///   finished — `finishedAt` set: the browser rendered the PDF and it is stored; content
+///              is locked. Reopening (only while unpaid) deletes the PDF and clears it.
+///   paid     — final. Never changes again; Duplicate starts a new draft from it.
+/// A paid scrapbook is never hard-deleted (its `Payment` names it); removing one sets
+/// `removedAt` and deletes its objects, as a gallery strip's remove does.
+model Scrapbook {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Manifest id of the template. Free-form, not an enum: a template is a FE manifest
+  /// entry, and one scrapbook keeps the template it was started on.
+  templateId String
+  title      String    @default("")
+  content    Json
+  /// When the rendered PDF was stored. Non-null means the content is locked.
+  finishedAt DateTime?
+  /// The rendered PDF, in the **private** bucket — the paid deliverable, only ever
+  /// handed out through the owner + paid gate on `GET /scrapbooks/:id/pdf(-url)`.
+  pdfKey     String?
+  pdfBytes   Int?
+  /// Declared by the client that rendered the PDF. Informational only.
+  pageCount  Int?
+  /// Small WebP of the cover page, in the **public** bucket, for the shelf and Purchases.
+  coverKey   String?
+  /// True once a payment for it settled, or it was unlocked free while payments are dark.
+  paid       Boolean   @default(false)
+  paidAt     DateTime?
+  /// Soft remove of a paid scrapbook: objects deleted, row kept for its `Payment`.
+  removedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  /// Doubles as the content version a finish was rendered from: the upload grant carries
+  /// it, and completing refuses if it moved (`409 content_changed`).
+  updatedAt  DateTime  @updatedAt
+
+  payments Payment[]
+
+  /// The shelf: one user's scrapbooks, most recently edited first.
+  @@index([userId, updatedAt])
+}
+
 /// One photo session (a room code) with at least one saved strip — a summary of its
 /// strips, so listing and counting sessions never has to group the Strip table.
 ///
@@ -406,20 +457,24 @@ model StripPrintImage {
 /// the webhook looks a payment up by. `grossAmount` is set server-side (count ×
 /// `STRIP_PRINT_PRICE_IDR`) — never trusted from the client.
 model Payment {
-  id             String    @id @default(cuid())
+  id             String      @id @default(cuid())
   /// Our Midtrans `order_id` (unique per attempt).
-  orderId        String    @unique
+  orderId        String      @unique
   /// Null once the payer deleted their account: the payment stays as the record of money
   /// received (there are no refunds), detached rather than deleted with them.
   userId         String?
-  user           User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  user           User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
   /// The strips this checkout unlocks (implicit m-n) — all flipped paid on settlement.
   /// Empty once the payer's account is deleted (their strips go with it).
   strips         Strip[]
+  /// The scrapbook this checkout unlocks (implicit m-n, like `strips`). A payment holds
+  /// strips **or** one scrapbook, never both — `/payments/charge` enforces it. Empty once
+  /// the payer's account is deleted (their scrapbooks go with it).
+  scrapbooks     Scrapbook[]
   grossAmount    Int
-  currency       String    @default("IDR")
+  currency       String      @default("IDR")
   /// pending | paid | failed | expired | cancelled
-  status         String    @default("pending")
+  status         String      @default("pending")
   /// Core API channel this order was charged on: gopay | shopeepay | qris.
   paymentType    String?
   /// Midtrans-hosted QR image (gopay, qris). Null for deeplink-only channels.
@@ -431,8 +486,8 @@ model Payment {
   expiresAt      DateTime?
   /// Raw Midtrans `transaction_status` from the last notification, for audit.
   midtransStatus String?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
   paidAt         DateTime?
 
   @@index([userId])

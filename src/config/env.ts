@@ -103,6 +103,27 @@ export interface Env {
    * nothing to show. Nothing already unlocked is ever auto-evicted.
    */
   galleryMaxItems: number
+  // ── Scrapbooks (docs/PLAN-scrapbook.md) ──
+  /**
+   * Price of one scrapbook, in whole rupiah, or null while it hasn't been decided.
+   *
+   * **No default on purpose.** A made-up fallback would be charged the moment payments
+   * were on; null instead makes scrapbook checkout answer `503 scrapbook_price_unset`.
+   * It deliberately doesn't refuse to boot: staging runs with payments on, and the rest
+   * of checkout (strips) must keep working while this one price is still open.
+   */
+  scrapbookPriceIdr: number | null
+  /**
+   * How many scrapbooks one user may hold at a time: drafts, finished and paid alike
+   * (removed ones don't count). Separate from both strip caps — a scrapbook never lives
+   * in the cart or the gallery. Checked at create and duplicate.
+   */
+  scrapbookMaxItems: number
+  /**
+   * Ceiling on a finished scrapbook's PDF. Expected ~2 MB for flat vector art (plan
+   * §7a); this is the backstop, and what the presigned PUT signs as the most it allows.
+   */
+  scrapbookPdfMaxBytes: number
   // ── Object storage (Cloudflare R2) ──
   /** R2 connection, or null when strip bytes should stay in Postgres. */
   r2: R2Config | null
@@ -141,6 +162,17 @@ export interface R2Config {
    * bucket through `GET /avatars/:userId` instead of off the edge.
    */
   avatarPublicBaseUrl: string | null
+  /**
+   * Bucket holding everything a scrapbook stores — the finished PDFs, their covers, and
+   * the scrapbook's own `incoming/` uploads (docs/PLAN-scrapbook.md). **Private**, like
+   * the print bucket: covers reach the browser through signed URLs, never a public origin.
+   *
+   * Null when unset, which is not a boot error: scrapbook storage then answers
+   * `503 storage_unavailable` and the rest of the API is unaffected. Never defaulted to
+   * another bucket — scrapbooks were moved out of the strip buckets on purpose (user
+   * decision, 2026-10-17), and a missing variable must not quietly put them back.
+   */
+  scrapbookBucket: string | null
 }
 
 /** Connection to the notification service. */
@@ -191,6 +223,12 @@ function positiveInt(name: string, raw: string | undefined, fallback: number): n
     throw new Error(`Invalid ${name}: "${raw}" (expected a positive integer)`)
   }
   return n
+}
+
+/** Like `positiveInt`, but unset means null rather than a fallback. */
+function optionalPositiveInt(name: string, raw: string | undefined): number | null {
+  if (raw === undefined || raw.trim() === '') return null
+  return positiveInt(name, raw, 0)
 }
 
 function nonNegativeInt(name: string, raw: string | undefined, fallback: number): number {
@@ -255,6 +293,15 @@ function parseR2(): R2Config | null {
     throw new Error('R2_AVATAR_BUCKET must not be R2_PRINT_BUCKET: avatars are public.')
   }
 
+  const scrapbookBucket = process.env.R2_SCRAPBOOK_BUCKET?.trim() || null
+  // Its own bucket or nothing: sharing one would mix scrapbook objects (and its
+  // `incoming/` lifecycle rule) back into a strip or avatar bucket.
+  if (scrapbookBucket && [bucket, printBucket || bucket, avatarBucket].includes(scrapbookBucket)) {
+    throw new Error(
+      'R2_SCRAPBOOK_BUCKET must be its own bucket, not R2_BUCKET, R2_PRINT_BUCKET or R2_AVATAR_BUCKET.',
+    )
+  }
+
   return {
     endpoint: process.env.R2_ENDPOINT?.trim() || `https://${accountId}.r2.cloudflarestorage.com`,
     accessKeyId: requiredSecret('R2_ACCESS_KEY_ID', process.env.R2_ACCESS_KEY_ID),
@@ -264,6 +311,7 @@ function parseR2(): R2Config | null {
     avatarBucket,
     publicBaseUrl,
     avatarPublicBaseUrl,
+    scrapbookBucket,
   }
 }
 
@@ -394,5 +442,12 @@ export const env: Env = {
     Boolean(process.env.MIDTRANS_SERVER_KEY?.trim() && process.env.MIDTRANS_CLIENT_KEY?.trim()),
   stripMaxItems: positiveInt('STRIP_MAX_ITEMS', process.env.STRIP_MAX_ITEMS, 5),
   galleryMaxItems: positiveInt('GALLERY_MAX_ITEMS', process.env.GALLERY_MAX_ITEMS, 25),
+  scrapbookPriceIdr: optionalPositiveInt('SCRAPBOOK_PRICE_IDR', process.env.SCRAPBOOK_PRICE_IDR),
+  scrapbookMaxItems: positiveInt('SCRAPBOOK_MAX_ITEMS', process.env.SCRAPBOOK_MAX_ITEMS, 5),
+  scrapbookPdfMaxBytes: positiveInt(
+    'SCRAPBOOK_PDF_MAX_BYTES',
+    process.env.SCRAPBOOK_PDF_MAX_BYTES,
+    12 * 1024 * 1024,
+  ),
   r2: parseR2(),
 }

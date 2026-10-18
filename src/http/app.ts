@@ -12,6 +12,7 @@ import { feedbackRouter } from './routes/feedback.js'
 import { locationsRouter } from './routes/locations.js'
 import { partnerRouter } from './routes/partner.js'
 import { paymentsRouter } from './routes/payments.js'
+import { scrapbooksRouter } from './routes/scrapbooks.js'
 import { statsRouter } from './routes/stats.js'
 import { testimonialsRouter } from './routes/testimonials.js'
 import { stripsRouter } from './routes/strips.js'
@@ -66,6 +67,7 @@ export function createApp(): Express {
   app.use('/stats', statsRouter)
   app.use('/testimonials', testimonialsRouter)
   app.use('/strips', stripsRouter)
+  app.use('/scrapbooks', scrapbooksRouter)
   app.use('/payments', paymentsRouter)
 
   // Must stay last: `notFoundHandler` catches unmatched paths, and `errorHandler` is

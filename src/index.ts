@@ -17,6 +17,7 @@ import { sweepFeedbackLimits } from './http/routes/feedback.js'
 import { sweepLocationsLimits } from './http/routes/locations.js'
 import { sweepPartnerInvites, sweepPartnerLimits } from './http/routes/partner.js'
 import { sweepPaymentLimits } from './http/routes/payments.js'
+import { sweepScrapbookLimits } from './http/routes/scrapbooks.js'
 import { sweepStatsLimits } from './http/routes/stats.js'
 import { sweepTestimonialsLimits } from './http/routes/testimonials.js'
 import { sweepRemoveLimits, sweepStripLimits, sweepUnlockLimits } from './http/routes/strips.js'
@@ -38,6 +39,7 @@ const sweeper = setInterval(() => {
     sweepStripLimits()
     sweepUnlockLimits()
     sweepRemoveLimits()
+    sweepScrapbookLimits()
     sweepPaymentLimits()
     sweepFeedbackLimits()
     sweepLocationsLimits()

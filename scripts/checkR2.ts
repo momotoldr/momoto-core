@@ -142,11 +142,11 @@ async function checkPublicUrl(bucket: Bucket, key: string, variable: string): Pr
  * — the app falls back to streaming through the API, so downloads still work and only
  * the Railway bill says anything is wrong.
  */
-async function checkPresignedGet(key: string, printBucket: string): Promise<void> {
+async function checkPresignedGet(bucket: Bucket, key: string, printBucket: string): Promise<void> {
   const origin = env.appBaseUrl
   let url: string
   try {
-    const presigned = await presignedGetUrl('private', key, {
+    const presigned = await presignedGetUrl(bucket, key, {
       filename: 'momoto-probe.png',
       contentType: 'image/png',
     })
@@ -209,15 +209,16 @@ async function checkPresignedGet(key: string, printBucket: string): Promise<void
  * Returns the keys it created, per bucket, so the caller can clean them up.
  */
 async function checkDirectUpload(
+  uploadBucket: Bucket,
   uploadBucketName: string,
   targets: [Bucket, string][],
 ): Promise<[Bucket, string[]][]> {
   const label = `direct upload into "${uploadBucketName}"`
   const incoming = incomingKey()
-  const created: [Bucket, string[]][] = [[UPLOAD_BUCKET, [incoming]]]
+  const created: [Bucket, string[]][] = [[uploadBucket, [incoming]]]
   let url: string
   try {
-    url = await presignedPutUrl(UPLOAD_BUCKET, incoming, {
+    url = await presignedPutUrl(uploadBucket, incoming, {
       contentType: 'image/png',
       contentLength: PROBE.length,
     })
@@ -260,7 +261,7 @@ async function checkDirectUpload(
     const promoted = `_healthcheck/${crypto.randomUUID()}.png`
     created.push([bucket, [promoted]])
     try {
-      await promoteObject(incoming, bucket, promoted, 'image/png')
+      await promoteObject(incoming, bucket, promoted, 'image/png', uploadBucket)
       const back = await readObject(bucket, promoted, PROBE.length)
       if (back?.equals(PROBE)) pass(`promote from incoming/ into "${name}"`)
       else fail(`promote into "${name}"`, 'the promoted object does not match what was uploaded')
@@ -320,6 +321,7 @@ async function main(): Promise<void> {
   console.log(`    bucket          ${r2.bucket}  (public)`)
   console.log(`    printBucket     ${r2.printBucket}  (private)`)
   console.log(`    avatarBucket    ${r2.avatarBucket}  (public)`)
+  console.log(`    scrapbookBucket ${r2.scrapbookBucket ?? '(not set)'}  (private)`)
   console.log(
     `    publicBaseUrl   ${r2.publicBaseUrl ?? '(not set — images proxy through the API)'}`,
   )
@@ -332,6 +334,9 @@ async function main(): Promise<void> {
   const publicKey = await roundTrip('public', `public bucket "${r2.bucket}"`)
   const privateKey = await roundTrip('private', `print bucket "${r2.printBucket}"`)
   const avatarKey = await roundTrip('avatar', `avatar bucket "${r2.avatarBucket}"`)
+  const scrapbookKey = r2.scrapbookBucket
+    ? await roundTrip('scrapbook', `scrapbook bucket "${r2.scrapbookBucket}"`)
+    : null
 
   console.log('\n  Public access')
   if (!r2.publicBaseUrl) {
@@ -351,12 +356,12 @@ async function main(): Promise<void> {
   }
 
   console.log('\n  Direct downloads (print bucket)')
-  if (privateKey) await checkPresignedGet(privateKey, r2.printBucket)
+  if (privateKey) await checkPresignedGet('private', privateKey, r2.printBucket)
 
   console.log('\n  Direct uploads')
   // The avatar role may resolve to the strips bucket; promoting into it twice would say
   // nothing new.
-  const uploadProbes = await checkDirectUpload(r2.printBucket, [
+  const uploadProbes = await checkDirectUpload(UPLOAD_BUCKET, r2.printBucket, [
     ['public', r2.bucket],
     ['private', r2.printBucket],
     ...(r2.avatarBucket !== r2.bucket ? [['avatar', r2.avatarBucket] as [Bucket, string]] : []),
@@ -366,6 +371,24 @@ async function main(): Promise<void> {
   )
   console.log('        has a rule deleting `incoming/` after 1 day — abandoned direct uploads')
   console.log('        are collected by nothing else.')
+
+  // Scrapbooks keep everything in their own bucket — PDFs, covers and their own
+  // `incoming/` — so its downloads, uploads and promotion are checked on their own.
+  console.log('\n  Scrapbook bucket')
+  if (!r2.scrapbookBucket) {
+    warn('R2_SCRAPBOOK_BUCKET is not set — scrapbooks cannot be finished, downloaded or shown.')
+  } else {
+    if (scrapbookKey) await checkPresignedGet('scrapbook', scrapbookKey, r2.scrapbookBucket)
+    uploadProbes.push(
+      ...(await checkDirectUpload('scrapbook', r2.scrapbookBucket, [
+        ['scrapbook', r2.scrapbookBucket],
+      ])),
+    )
+    warn(
+      `Lifecycle rules cannot be checked with this token. Confirm by hand that "${r2.scrapbookBucket}"`,
+    )
+    console.log('        has its own rule deleting `incoming/` after 1 day.')
+  }
 
   console.log('\n  Thumbnails')
   const thumbnail = await makeThumbnail(PROBE)
@@ -377,6 +400,7 @@ async function main(): Promise<void> {
     publicKey ? deleteImages('public', [publicKey]) : Promise.resolve(),
     privateKey ? deleteImages('private', [privateKey]) : Promise.resolve(),
     avatarKey ? deleteImages('avatar', [avatarKey]) : Promise.resolve(),
+    scrapbookKey ? deleteImages('scrapbook', [scrapbookKey]) : Promise.resolve(),
     ...uploadProbes.map(([bucket, keys]) => deleteImages(bucket, keys)),
   ])
 
@@ -391,7 +415,12 @@ async function main(): Promise<void> {
   console.log('  This script cannot verify one thing for you: that the PRINT bucket')
   console.log(`  ("${r2.printBucket}") is NOT publicly readable. Confirm by hand under`)
   console.log('  R2 -> that bucket -> Settings -> Public access = disabled. It holds the')
-  console.log('  clean copies people pay for.\n')
+  console.log('  clean copies people pay for.')
+  if (r2.scrapbookBucket) {
+    console.log(`  The same goes for the scrapbook bucket ("${r2.scrapbookBucket}"): it holds`)
+    console.log('  paid PDFs and must have public access disabled too.')
+  }
+  console.log('')
 }
 
 main().catch((error) => {
