@@ -40,13 +40,22 @@ export function isPaymentMethod(value: unknown): value is PaymentMethod {
   return typeof value === 'string' && (PAYMENT_METHODS as readonly string[]).includes(value)
 }
 
+/** One line on the Midtrans receipt: strips at their price, scrapbooks at theirs. */
+export interface ChargeItem {
+  /** The line item's id: `strip-print` or `scrapbook`. */
+  id: string
+  name: string
+  /** Price per item, in whole rupiah. */
+  price: number
+  quantity: number
+}
+
 export interface ChargeOrder {
   orderId: string
-  /** Price per strip, in whole rupiah. */
-  unitPrice: number
-  /** How many strips this checkout unlocks. */
-  quantity: number
-  itemName: string
+  /** At least one line; empty lines (quantity 0) are left off. */
+  items: ChargeItem[]
+  /** App path a wallet returns the buyer to (ShopeePay's `callback_url`): the cart. */
+  returnPath: string
   customer: { name: string; email: string | null }
   method: PaymentMethod
 }
@@ -90,35 +99,43 @@ function actionUrl(actions: unknown, name: string): string | null {
 }
 
 /** Per-channel charge parameters. Shared fields are merged in by `chargeTransaction`. */
-function channelParams(method: PaymentMethod): Record<string, unknown> {
+function channelParams(method: PaymentMethod, returnPath: string): Record<string, unknown> {
   switch (method) {
     case 'gopay':
       // `enable_callback` off: we own the return journey, and the notification — not the
       // browser coming back — is what settles the order.
       return { gopay: { enable_callback: false } }
     case 'shopeepay':
-      return { shopeepay: { callback_url: `${env.appBaseUrl}/cart` } }
+      return { shopeepay: { callback_url: `${env.appBaseUrl}${returnPath}` } }
     case 'qris':
       // GoPay as acquirer; the QR is still QRIS, scannable by any Indonesian wallet.
       return { qris: { acquirer: 'gopay' } }
   }
 }
 
+/** What a set of lines adds up to — the order's `gross_amount`. */
+export function chargeTotal(items: ChargeItem[]): number {
+  return items.reduce((total, item) => total + item.price * item.quantity, 0)
+}
+
 /** Open a transaction on one channel and return what the client needs to render. */
 export async function chargeTransaction(order: ChargeOrder): Promise<ChargeResult> {
-  // gross_amount must equal Σ(price × quantity); one line item, quantity = #strips.
-  const grossAmount = order.unitPrice * order.quantity
+  // gross_amount must equal Σ(price × quantity) over the lines, or Midtrans refuses it.
+  const items = order.items.filter((item) => item.quantity > 0)
   const response = (await getCore().charge({
     payment_type: order.method,
-    transaction_details: { order_id: order.orderId, gross_amount: grossAmount },
-    item_details: [
-      { id: 'strip-print', price: order.unitPrice, quantity: order.quantity, name: order.itemName },
-    ],
+    transaction_details: { order_id: order.orderId, gross_amount: chargeTotal(items) },
+    item_details: items.map((item) => ({
+      id: item.id,
+      price: item.price,
+      quantity: item.quantity,
+      name: item.name,
+    })),
     customer_details: {
       first_name: order.customer.name,
       ...(order.customer.email ? { email: order.customer.email } : {}),
     },
-    ...channelParams(order.method),
+    ...channelParams(order.method, order.returnPath),
   })) as Record<string, unknown>
 
   return {
@@ -150,6 +167,15 @@ export function verifyNotificationSignature(payload: {
     )
     .digest('hex')
   return expected === payload.signature_key
+}
+
+/**
+ * Cancel a transaction that was opened but will never be recorded — its QR was never shown
+ * to anyone (see the scrapbook branch of `/payments/charge`). Best-effort: a failure is
+ * logged by the caller, and an unpaid QR expires on its own anyway.
+ */
+export async function cancelTransaction(orderId: string): Promise<void> {
+  await getCore().transaction.cancel(orderId)
 }
 
 /** Re-query a transaction's authoritative status straight from Midtrans. */

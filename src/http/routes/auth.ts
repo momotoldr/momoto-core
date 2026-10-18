@@ -48,6 +48,7 @@ import { signUploadGrant, verifyUploadGrant } from '../../storage/uploadGrant.js
 import { asyncRoute } from '../asyncRoute.js'
 import { readImageSize, sniffImageType } from '../imageType.js'
 import { requireAuth } from '../middleware/requireAuth.js'
+import { deleteScrapbookObjects, scrapbookObjectsOf } from './scrapbooks.js'
 import { deleteStripObjects } from './strips.js'
 
 export const authRouter = Router()
@@ -1099,6 +1100,8 @@ authRouter.delete(
         printImage: { select: { storageKey: true } },
       },
     })
+    // Scrapbooks likewise: a PDF in the private bucket and a cover in the public one each.
+    const scrapbooks = await scrapbookObjectsOf(userId)
 
     await prisma.user.delete({ where: { id: userId } })
     // Their testimonials cascaded away (or dropped them as a partner) — refresh the landing cache.
@@ -1106,6 +1109,7 @@ authRouter.delete(
     // Best-effort, after the row is gone: a failure is logged, and the account is deleted
     // either way.
     await deleteStripObjects(strips)
+    await deleteScrapbookObjects(scrapbooks)
     if (user.avatarKey) await deleteImages('avatar', [user.avatarKey])
     res.clearCookie(REFRESH_COOKIE, refreshCookieOptions())
     logger.info('auth.account.deleted', { userId })
