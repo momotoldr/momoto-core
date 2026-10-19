@@ -116,7 +116,7 @@ export interface Env {
   /**
    * How many scrapbooks one user may hold at a time: drafts, finished and paid alike
    * (removed ones don't count). Separate from both strip caps — a scrapbook never lives
-   * in the cart or the gallery. Checked at create and duplicate.
+   * in the cart or the gallery. Checked at create.
    */
   scrapbookMaxItems: number
   /**
