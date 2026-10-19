@@ -99,7 +99,7 @@ const COVER_BOUNDS = { maxWidth: 800, maxHeight: 1200, maxBytes: 512 * 1024 }
 const saveLimiter = new RateLimiter(600, 10 * 60_000)
 /** Finishing moves megabytes into R2 — the same posture as a strip save. */
 const finishLimiter = new RateLimiter(20, 10 * 60_000)
-/** Everything else that changes a row: create, duplicate, reopen, unlock, remove, delete. */
+/** Everything else that changes a row: create, reopen, unlock, remove, delete. */
 const changeLimiter = new RateLimiter(60, 10 * 60_000)
 
 /** Reclaim expired scrapbook rate windows (wired into the periodic sweep). */
@@ -273,7 +273,7 @@ async function quotaFor(userId: string) {
 }
 
 /**
- * Refuse a create or duplicate at the cap. Checked before the insert; two tabs racing can
+ * Refuse a create at the cap. Checked before the insert; two tabs racing can
  * land at cap + 1, accepted rather than paying for a serializable transaction (the cart's
  * posture too).
  */
@@ -883,7 +883,7 @@ scrapbooksRouter.post(
 // ── POST /scrapbooks/:id/reopen ─── back to a draft ──────────────────────────
 /**
  * "Keep editing" on a finished, unpaid scrapbook: delete its PDF and cover and unlock the
- * content. Refused once paid (a paid scrapbook is final — Duplicate instead) and while a
+ * content. Refused once paid (a paid scrapbook is final — start a new one instead) and while a
  * payment attempt that can still be paid names it. Reopening a draft is a no-op success.
  */
 scrapbooksRouter.post(
@@ -972,39 +972,6 @@ scrapbooksRouter.post(
     const now = await findOwn(userId, scrapbookId)
     if (!now) return notFound(res)
     res.json({ scrapbook: serializeScrapbook(now) })
-  }),
-)
-
-// ── POST /scrapbooks/:id/duplicate ─── a new draft from any scrapbook ────────
-/**
- * How a user gets a different version of a paid (final) scrapbook — or a copy of any
- * other. Copies template, title and content; never the PDF, cover or paid state. Strips
- * that have left the gallery since come along and show as missing, like in any draft.
- */
-scrapbooksRouter.post(
-  '/:id/duplicate',
-  requireAuth,
-  asyncRoute(async (req, res) => {
-    const userId = req.userId as string
-    if (!changeLimiter.allow(userId)) {
-      res.status(429).json({ error: 'too_many_requests' })
-      return
-    }
-    const source = await findOwn(userId, req.params.id as string)
-    if (!source) return notFound(res)
-    if (await refuseIfFull(res, userId)) return
-
-    const row = await prisma.scrapbook.create({
-      data: {
-        userId,
-        templateId: source.templateId,
-        title: source.title,
-        content: storedContent(source.content) as unknown as Prisma.InputJsonObject,
-      },
-      select: scrapbookSelect,
-    })
-    logger.info('scrapbooks.duplicated', { userId, scrapbookId: row.id, from: source.id })
-    res.status(201).json({ scrapbook: serializeScrapbook(row) })
   }),
 )
 
