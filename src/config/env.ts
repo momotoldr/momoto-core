@@ -22,6 +22,12 @@ export interface Env {
   jwtAccessTtlSeconds: number
   jwtRefreshTtlSeconds: number
   googleClientId: string | null
+  /**
+   * Lets `POST /auth/google` redeem the authorization code the FE's custom button
+   * gets from Google's popup. Null keeps that path off (503 `google_not_configured`);
+   * an ID token, which needs no secret, is still accepted either way.
+   */
+  googleClientSecret: string | null
   cookieSecure: boolean
   /**
    * Closed-beta switch: `true` refuses self-service signup, so the only accounts that
@@ -413,6 +419,7 @@ export const env: Env = {
   jwtAccessTtlSeconds: positiveInt('JWT_ACCESS_TTL', process.env.JWT_ACCESS_TTL, 3600),
   jwtRefreshTtlSeconds: positiveInt('JWT_REFRESH_TTL', process.env.JWT_REFRESH_TTL, 604_800),
   googleClientId: process.env.GOOGLE_CLIENT_ID?.trim() || null,
+  googleClientSecret: process.env.GOOGLE_CLIENT_SECRET?.trim() || null,
   cookieSecure: process.env.COOKIE_SECURE?.trim() === 'true',
   inviteOnly: process.env.INVITE_ONLY?.trim() === 'true',
   notify: parseNotify(),
