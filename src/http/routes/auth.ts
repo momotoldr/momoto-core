@@ -7,7 +7,7 @@ import {
   resendClaim,
   verifyEmailClaim,
 } from '../../auth/emailVerification.js'
-import { verifyGoogleIdToken } from '../../auth/google.js'
+import { exchangeGoogleCode, isOwnGoogleCallback } from '../../auth/google.js'
 import {
   consumePasswordReset,
   isResetTokenValid,
@@ -319,6 +319,9 @@ authRouter.post(
   }),
 )
 
+/** RFC 7636: a PKCE code verifier is 43–128 characters of this alphabet. */
+const PKCE_VERIFIER = /^[A-Za-z0-9\-._~]{43,128}$/
+
 // ── POST /auth/google ────────────────────────────────────────────────────────
 authRouter.post(
   '/google',
@@ -327,15 +330,20 @@ authRouter.post(
     if (!authLimiter.allow(rateLimitKey(ip)))
       return void limited(res, 'auth.google.ratelimited', ip)
 
-    const idToken = String(req.body?.idToken ?? '')
-    if (!idToken) {
+    // From the FE's redirect sign-in (its /auth/google/callback page): the code, the
+    // redirect URI it started from, and its PKCE verifier. Nothing else is accepted — in
+    // particular not a bare ID token, which would make any leaked one a login.
+    const code = String(req.body?.code ?? '')
+    const redirectUri = String(req.body?.redirectUri ?? '')
+    const codeVerifier = String(req.body?.codeVerifier ?? '')
+    if (!code || !isOwnGoogleCallback(redirectUri) || !PKCE_VERIFIER.test(codeVerifier)) {
       res.status(400).json({ error: 'invalid_input' })
       return
     }
 
     let identity
     try {
-      identity = await verifyGoogleIdToken(idToken)
+      identity = await exchangeGoogleCode(code, redirectUri, codeVerifier)
     } catch (err) {
       const code = err instanceof Error ? err.message : 'invalid_google_token'
       res.status(code === 'google_not_configured' ? 503 : 401).json({ error: code })
@@ -349,6 +357,25 @@ authRouter.post(
     })
     if (!user) {
       const byEmail = await prisma.user.findUnique({ where: { email: identity.email } })
+
+      // Linking a Google account into an existing Momoto account hands over everything in
+      // it, so it happens only when the address proves the same person. Two refusals:
+      if (byEmail?.googleId) {
+        // That account already belongs to a *different* Google account (this one's id
+        // matched nothing above). Re-pointing it would lock its owner's Google login out
+        // and give the account to whoever holds the address now.
+        logger.warn('auth.google.link_refused', { userId: byEmail.id, reason: 'other_google' })
+        res.status(409).json({ error: 'google_other_account' })
+        return
+      }
+      if (byEmail && !identity.emailAuthoritative) {
+        // Google confirmed this non-Gmail, non-Workspace address once, at signup; it
+        // doesn't vouch for who holds it today (a lapsed, re-registered domain). The
+        // account's owner still has their password.
+        logger.warn('auth.google.link_refused', { userId: byEmail.id, reason: 'not_authoritative' })
+        res.status(409).json({ error: 'google_email_in_use' })
+        return
+      }
       // Closed beta: Google may still *authenticate* an account that already exists —
       // anyone already linked keeps their way in — but it may no longer *create* one.
       // Without this, `/auth/register` being shut means nothing: this route is the other
@@ -360,7 +387,7 @@ authRouter.post(
       }
 
       // Google is the one source we take an address from without mailing our own
-      // link: `verifyGoogleIdToken` rejects any token whose `email_verified` isn't
+      // link: `exchangeGoogleCode` rejects any token whose `email_verified` isn't
       // true, so the mailbox was proven before it reached us. Stamping
       // `emailVerifiedAt` here is what lets these accounts reset their password.
       user = byEmail
