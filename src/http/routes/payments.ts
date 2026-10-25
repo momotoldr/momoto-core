@@ -6,6 +6,8 @@ import { Router } from 'express'
 import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
 import { logger } from '../../lib/logger.js'
+import { sendPaymentReceipt } from '../../notifications/client.js'
+import { normalizeLang } from '../../notifications/lang.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
 import {
   cancelTransaction,
@@ -145,7 +147,12 @@ paymentsRouter.post(
       return
     }
 
-    const body = req.body as { stripIds?: unknown; scrapbookIds?: unknown; method?: unknown }
+    const body = req.body as {
+      stripIds?: unknown
+      scrapbookIds?: unknown
+      method?: unknown
+      lang?: unknown
+    }
     if (!isPaymentMethod(body.method)) {
       res.status(400).json({ error: 'invalid_method' })
       return
@@ -259,6 +266,8 @@ paymentsRouter.post(
           deeplinkUrl: charge.deeplinkUrl,
           expiresAt: charge.expiresAt,
           midtransStatus: charge.transactionStatus,
+          // For the receipt the webhook sends: it has no request of the payer's to read.
+          lang: normalizeLang(body.lang),
           strips: { connect: stripIds.map((id) => ({ id })) },
           scrapbooks: { connect: scrapbookIds.map((id) => ({ id })) },
         },
@@ -402,7 +411,11 @@ paymentsRouter.post(
 
     const payment = await prisma.payment.findUnique({
       where: { orderId },
-      include: { strips: { select: { id: true } }, scrapbooks: { select: { id: true } } },
+      include: {
+        strips: { select: { id: true } },
+        scrapbooks: { select: { id: true, title: true } },
+        user: { select: { email: true, emailVerifiedAt: true } },
+      },
     })
     if (!payment) {
       // Unknown order — ack so Midtrans stops retrying, but do nothing.
@@ -451,25 +464,50 @@ paymentsRouter.post(
       // under a live payment can't have been reopened or deleted (both refuse under its row
       // lock), so it is still finished with its PDF; only account deletion removes it, and
       // then there is nothing left to flip.
-      await prisma.$transaction([
-        prisma.payment.update({
-          where: { orderId },
+      //
+      // The flip is conditional on the row not being paid yet, because Midtrans can deliver
+      // the same settlement twice at once and both would pass the `paid` check above. Only
+      // the one that flips it goes on to unlock and send the receipt — otherwise the payer
+      // gets two.
+      const flipped = await prisma.$transaction(async (tx) => {
+        const { count } = await tx.payment.updateMany({
+          where: { orderId, status: { not: 'paid' } },
           data: { status: 'paid', midtransStatus: transactionStatus, paidAt: now },
-        }),
-        prisma.strip.updateMany({
+        })
+        if (count === 0) return false
+        await tx.strip.updateMany({
           where: { id: { in: stripIds } },
           data: { paid: true, paidAt: now },
-        }),
-        prisma.scrapbook.updateMany({
+        })
+        await tx.scrapbook.updateMany({
           where: { id: { in: scrapbookIds } },
           data: { paid: true, paidAt: now },
-        }),
-      ])
+        })
+        return true
+      })
+      if (!flipped) {
+        res.status(200).json({ ok: true })
+        return
+      }
       logger.info('payments.paid', {
         orderId,
         strips: stripIds.length,
         scrapbooks: scrapbookIds.length,
       })
+
+      // Verified addresses only, as with the password mail: an operator-typed address
+      // nobody has proven could be a typo, and this one says what someone bought. Not
+      // awaited — the money is in and the items are unlocked; mail can't undo that.
+      if (payment.user?.email && payment.user.emailVerifiedAt) {
+        void sendPaymentReceipt(payment.user.email, normalizeLang(payment.lang), {
+          orderId,
+          grossAmount: payment.grossAmount,
+          paidAt: now,
+          method: isPaymentMethod(payment.paymentType) ? payment.paymentType : null,
+          stripCount: stripIds.length,
+          scrapbookTitles: payment.scrapbooks.map((s) => s.title),
+        })
+      }
     } else {
       await prisma.payment.update({
         where: { orderId },
