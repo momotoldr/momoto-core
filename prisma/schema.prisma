@@ -486,6 +486,9 @@ model Payment {
   expiresAt      DateTime?
   /// Raw Midtrans `transaction_status` from the last notification, for audit.
   midtransStatus String?
+  /// UI language at checkout ('en' | 'id'), so the settlement receipt — sent from the
+  /// webhook, which has no request of the payer's to read it from — matches it.
+  lang           String?
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
   paidAt         DateTime?

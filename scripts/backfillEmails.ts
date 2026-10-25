@@ -11,13 +11,12 @@
  *
  * The closed-beta accounts were created by `seedTesters.ts` before it stored emails,
  * so they have none — which means no password reset, because there is nowhere to send
- * the link. The addresses are not lost: they are sitting in the CSV that
- * `sendInvites.ts` already reads to mail those same people their credentials. This
- * script joins the two back together.
+ * the link. The addresses are not lost: they are sitting in the beta testers CSV.
+ * This script joins the two back together.
  *
  * ## Input
  *
- * The same CSV `send:invites` takes — a header row, case-insensitive column names:
+ * The beta testers CSV — a header row, case-insensitive column names:
  *
  *   username  required — the account to attach to
  *   email     required
@@ -168,8 +167,7 @@ async function sendConfirmations(dryRun: boolean): Promise<number> {
       // link, the TTL and the template are identical to the ones a user gets from
       // Profile — one mechanism, one thing to keep working.
       await claimEmail(user.id, user.email as string, 'en')
-      // Trickle: shared mailboxes throttle per hour, and this is the same transport
-      // `sendInvites.ts` deliberately paces itself on.
+      // Trickle: shared mailboxes throttle per hour.
       await new Promise((resolve) => setTimeout(resolve, 1_500))
     }
     sent += 1

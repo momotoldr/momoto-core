@@ -27,7 +27,6 @@
     "make-admin:staging": "node --env-file=.env.staging --import tsx scripts/makeAdmin.ts",
     "make-admin": "tsx scripts/makeAdmin.ts",
     "purge:strips": "tsx scripts/purgeStrips.ts",
-    "send:invites": "tsx scripts/sendInvites.ts",
     "backfill:strips": "tsx scripts/backfillStripStorage.ts",
     "backfill:avatars": "tsx scripts/backfillAvatarStorage.ts",
     "check:r2": "tsx scripts/checkR2.ts",
