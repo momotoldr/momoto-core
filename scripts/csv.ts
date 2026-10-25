@@ -3,9 +3,9 @@
  *
  * Enough of RFC 4180 for a spreadsheet export — quoted fields, embedded commas,
  * doubled quotes — and nothing more, because a spreadsheet export is the only thing
- * any of these scripts will ever read. `seedTesters`, `sendInvites` and
- * `backfillEmails` all take the same shape of file; this is the one implementation
- * of it, so a fix to the parser doesn't have to be found in three places.
+ * any of these scripts will ever read. `seedTesters` and `backfillEmails` take the
+ * same shape of file; this is the one implementation of it, so a fix to the parser
+ * doesn't have to be found in two places.
  */
 
 /** Splits one line into trimmed cells. */
@@ -101,8 +101,8 @@ export function looksLikeCsv(text: string, ...knownColumns: string[]): boolean {
  * Not optional politeness: display names now come from a signup form, where
  * "Dewi, Sinta" is an ordinary thing to type. Written raw, that row grows an extra
  * field and every column after it shifts — and the scripts that read these files back
- * (`send:invites`, `backfill:emails`) address columns by index, so the silent result
- * is mailing one tester another tester's password.
+ * (`backfill:emails`) address columns by index, so the silent result is attaching one
+ * tester's email to another tester's account.
  */
 export function toCsvRow(cells: (string | null | undefined)[]): string {
   return cells

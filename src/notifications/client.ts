@@ -24,20 +24,44 @@ type Payload =
   | { type: 'password_reset'; data: { url: string; expiresInMinutes: number } }
   | { type: 'password_changed'; data: { resetUrl: string } }
   | {
-      type: 'beta_invite'
+      type: 'payment_receipt'
       data: {
-        displayName: string
-        username: string
-        password: string
-        // A second login for the partner, printed in the same email. Optional, and
-        // both move together — momoto-notify rejects half a pair.
-        partnerUsername?: string
-        partnerPassword?: string
+        orderId: string
+        grossAmount: number
+        paidAt: string
+        method: 'gopay' | 'shopeepay' | 'qris' | null
+        stripCount: number
+        scrapbookTitles: string[]
       }
     }
 
 /** How long to wait on the service before giving up. It only has to accept, not send. */
 const TIMEOUT_MS = 5_000
+
+/**
+ * One retry, after this long, when the request provably never reached the service.
+ *
+ * That is the shape of a notify redeploy: the old instance stops listening a moment
+ * before traffic moves to the new one, so a connection lands on nothing. Two seconds
+ * is well past that switch, and costs no user anything — request-path callers don't
+ * await the send.
+ */
+const RETRY_DELAY_MS = 2_000
+
+/**
+ * Failures where nothing was delivered, so a second attempt can't send the mail twice.
+ *
+ * Deliberately not here: a **timeout** (the service may have queued it and only the
+ * reply was lost — retrying would mail it twice), `ECONNRESET` (same ambiguity), and
+ * any HTTP status — a 400 or 401 won't fix itself, and a 503 `queue_full` means hours
+ * behind, not seconds.
+ */
+const NEVER_ARRIVED = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'])
+
+function neverArrived(err: unknown): boolean {
+  const cause = err instanceof Error ? (err.cause as NodeJS.ErrnoException | undefined) : undefined
+  return cause?.code !== undefined && NEVER_ARRIVED.has(cause.code)
+}
 
 async function post(path: string, body: unknown): Promise<Response | null> {
   const notify = env.notify
@@ -79,18 +103,29 @@ export async function notify(to: string, lang: Lang, payload: Payload): Promise<
     return false
   }
 
-  try {
-    const res = await post('/notifications', { to, lang, ...payload })
-    if (!res) return false
-    if (!res.ok) {
-      logger.error('notify.rejected', { type: payload.type, status: res.status })
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const res = await post('/notifications', { to, lang, ...payload })
+      if (!res) return false
+      if (!res.ok) {
+        logger.error('notify.rejected', { type: payload.type, status: res.status })
+        return false
+      }
+      logger.info('notify.accepted', { type: payload.type, attempt })
+      return true
+    } catch (err) {
+      if (attempt === 1 && neverArrived(err)) {
+        logger.warn('notify.retrying', { type: payload.type, ...describeFetchError(err) })
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS))
+        continue
+      }
+      logger.error('notify.unreachable', {
+        type: payload.type,
+        attempt,
+        ...describeFetchError(err),
+      })
       return false
     }
-    logger.info('notify.accepted', { type: payload.type })
-    return true
-  } catch (err) {
-    logger.error('notify.unreachable', { type: payload.type, ...describeFetchError(err) })
-    return false
   }
 }
 
@@ -113,34 +148,6 @@ function describeFetchError(err: unknown): Record<string, unknown> {
     ...(cause?.code ? { code: cause.code } : {}),
     ...(cause?.syscall ? { syscall: cause.syscall } : {}),
     ...(cause?.message && cause.message !== cause.code ? { detail: cause.message } : {}),
-  }
-}
-
-/**
- * Renders a message without sending it — used by `send:invites --dry-run`.
- *
- * Like `notify`, this **never throws**: an unreachable service is the ordinary case
- * here (nobody remembers to start momoto-notify before a dry run), and letting the
- * raw failure escape reaches the operator as a bare "fetch failed" with the actual
- * reason buried on `err.cause`. Returning null instead lets the caller print its own
- * instructions, and the log line below names the reason.
- */
-export async function previewNotification(
-  to: string,
-  lang: Lang,
-  payload: Payload,
-): Promise<{ subject: string; text: string; html: string } | null> {
-  try {
-    const res = await post('/notifications/preview', { to, lang, ...payload })
-    if (!res) return null
-    if (!res.ok) {
-      logger.error('notify.preview_rejected', { type: payload.type, status: res.status })
-      return null
-    }
-    return (await res.json()) as { subject: string; text: string; html: string }
-  } catch (err) {
-    logger.error('notify.preview_unreachable', { type: payload.type, ...describeFetchError(err) })
-    return null
   }
 }
 
@@ -170,5 +177,24 @@ export function sendPasswordChanged(to: string, lang: Lang): Promise<boolean> {
   return notify(to, lang, {
     type: 'password_changed',
     data: { resetUrl: `${env.appBaseUrl}/forgot-password` },
+  })
+}
+
+/** The receipt for a settled payment. */
+export function sendPaymentReceipt(
+  to: string,
+  lang: Lang,
+  order: {
+    orderId: string
+    grossAmount: number
+    paidAt: Date
+    method: 'gopay' | 'shopeepay' | 'qris' | null
+    stripCount: number
+    scrapbookTitles: string[]
+  },
+): Promise<boolean> {
+  return notify(to, lang, {
+    type: 'payment_receipt',
+    data: { ...order, paidAt: order.paidAt.toISOString() },
   })
 }
