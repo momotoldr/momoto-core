@@ -96,6 +96,8 @@ model User {
   strips             Strip[]
   scrapbooks         Scrapbook[]
   payments           Payment[]
+  promoGrants        PromoGrant[]             @relation("PromoGrantOwner")
+  promoGrantsSourced PromoGrant[]             @relation("PromoGrantSource")
   feedbacks          Feedback[]               @relation("FeedbackAuthor")
   supportTickets     SupportTicket[]          @relation("SupportTicketAuthor")
   partnerFeedbacks   Feedback[]               @relation("FeedbackPartner")
@@ -467,10 +469,18 @@ model Payment {
   /// The strips this checkout unlocks (implicit m-n) — all flipped paid on settlement.
   /// Empty once the payer's account is deleted (their strips go with it).
   strips         Strip[]
-  /// The scrapbook this checkout unlocks (implicit m-n, like `strips`). A payment holds
-  /// strips **or** one scrapbook, never both — `/payments/charge` enforces it. Empty once
-  /// the payer's account is deleted (their scrapbooks go with it).
+  /// The scrapbooks this checkout unlocks (implicit m-n, like `strips`). One order can
+  /// hold strips and scrapbooks together (since 2026-10-17). Empty once the payer's
+  /// account is deleted (their scrapbooks go with it).
   scrapbooks     Scrapbook[]
+  /// Priced with the partner buy 1 get 1 (docs/PLAN-promos.md §1): two of `strips` were
+  /// charged as one. The reward is spent when this settles, not when it's charged.
+  bogo           Boolean     @default(false)
+  /// The reward this payment spent, once it settled.
+  usedGrant      PromoGrant?
+  /// How many scrapbook bundles priced it (docs/PLAN-promos.md §2): each one finished
+  /// scrapbook + 3 of its unpaid strips at the bundle price, as one Midtrans line.
+  bundles        Int         @default(0)
   grossAmount    Int
   currency       String      @default("IDR")
   /// pending | paid | failed | expired | cancelled
@@ -503,6 +513,32 @@ model Payment {
   /// Admin Transactions revenue: the live sum for a range's partial first/last day
   /// (whole days come off the `revenue` DailyStat counter).
   @@index([paidAt])
+}
+
+/// A one-time promo reward on an account (docs/PLAN-promos.md §1). One row per
+/// (user, kind), ever: the unique index is what makes "once per account" hold across
+/// unlinks and relinks. Deleted with the account.
+model PromoGrant {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation("PromoGrantOwner", fields: [userId], references: [id], onDelete: Cascade)
+  /// `partner_bogo` for now. A string, so a later promo is a new kind, not a migration.
+  kind            String
+  /// The partner whose link earned it, for support and the portal. SetNull: the reward
+  /// outlives the link and the other account.
+  sourceUserId    String?
+  sourceUser      User?     @relation("PromoGrantSource", fields: [sourceUserId], references: [id], onDelete: SetNull)
+  /// `link` | `beta_backfill`
+  reason          String
+  createdAt       DateTime  @default(now())
+  /// Set when the payment that used it settles.
+  usedAt          DateTime?
+  usedByPaymentId String?   @unique
+  usedByPayment   Payment?  @relation(fields: [usedByPaymentId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, kind])
+  /// For the SetNull when the source account is deleted.
+  @@index([sourceUserId])
 }
 
 /// **Legacy** storage for an uploaded profile picture, as bytes in Postgres.

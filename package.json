@@ -13,6 +13,7 @@
     "build": "prisma generate && tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json",
+    "test": "tsx --test test/*.test.ts",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -34,7 +35,9 @@
     "reset:password": "tsx scripts/resetPassword.ts",
     "backfill:emails": "tsx scripts/backfillEmails.ts",
     "check:notify": "tsx scripts/checkNotify.ts",
-    "import:regions": "tsx scripts/importRegions.ts"
+    "import:regions": "tsx scripts/importRegions.ts",
+    "promos:backfill-beta": "tsx scripts/backfillPartnerPromo.ts",
+    "promos:backfill-beta:staging": "node --env-file=.env.staging --import tsx scripts/backfillPartnerPromo.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1118.0",
