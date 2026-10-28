@@ -12,6 +12,7 @@ import { feedbackRouter } from './routes/feedback.js'
 import { locationsRouter } from './routes/locations.js'
 import { partnerRouter } from './routes/partner.js'
 import { paymentsRouter } from './routes/payments.js'
+import { promosRouter } from './routes/promos.js'
 import { scrapbooksRouter } from './routes/scrapbooks.js'
 import { statsRouter } from './routes/stats.js'
 import { testimonialsRouter } from './routes/testimonials.js'
@@ -69,6 +70,7 @@ export function createApp(): Express {
   app.use('/strips', stripsRouter)
   app.use('/scrapbooks', scrapbooksRouter)
   app.use('/payments', paymentsRouter)
+  app.use('/promos', promosRouter)
 
   // Must stay last: `notFoundHandler` catches unmatched paths, and `errorHandler` is
   // the sink every `asyncRoute` rejection is funnelled into.

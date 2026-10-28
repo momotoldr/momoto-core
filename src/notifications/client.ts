@@ -32,6 +32,10 @@ type Payload =
         method: 'gopay' | 'shopeepay' | 'qris' | null
         stripCount: number
         scrapbookTitles: string[]
+        // Ignored by a notify that predates the promos — its validator only reads the
+        // fields it knows — so core can ship these first.
+        bogo: boolean
+        bundled: number
       }
     }
 
@@ -191,6 +195,10 @@ export function sendPaymentReceipt(
     method: 'gopay' | 'shopeepay' | 'qris' | null
     stripCount: number
     scrapbookTitles: string[]
+    /** Priced with the partner buy 1 get 1 (docs/PLAN-promos.md). */
+    bogo: boolean
+    /** How many scrapbook bundles priced it: each one scrapbook + 3 of the strips. */
+    bundled: number
   },
 ): Promise<boolean> {
   return notify(to, lang, {
