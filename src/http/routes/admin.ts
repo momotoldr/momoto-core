@@ -23,6 +23,7 @@ import {
   isTestimonialFeature,
   markTestimonialsChanged,
 } from '../../lib/testimonials.js'
+import { PARTNER_BOGO } from '../../promos/promos.js'
 import { deleteImages } from '../../storage/objectStore.js'
 import { asyncRoute } from '../asyncRoute.js'
 import { requireAdmin } from '../middleware/requireAdmin.js'
@@ -133,7 +134,7 @@ async function withUserCount<T extends { id: string }>(user: T) {
 
 /**
  * Attach each payment's strip and scrapbook counts, as `serializeAdminPayment` reads them.
- * A payment holds strips or one scrapbook, so exactly one of the two is non-zero.
+ * One order can hold both kinds (since 2026-10-17), so either or both can be non-zero.
  */
 async function withStripCounts<T extends { id: string }>(
   payments: T[],
@@ -607,7 +608,7 @@ adminRouter.get(
       return
     }
 
-    const [strips, payments, feedback, support] = await Promise.all([
+    const [strips, payments, feedback, support, partnerReward, bundleOrders] = await Promise.all([
       prisma.strip.findMany({
         where: { userId: user.id },
         orderBy: { createdAt: 'desc' },
@@ -641,6 +642,8 @@ adminRouter.get(
           createdAt: true,
           updatedAt: true,
           paidAt: true,
+          bogo: true,
+          bundles: true,
           user: { select: userSummarySelect },
         },
       }),
@@ -656,11 +659,47 @@ adminRouter.get(
         take: 10,
         select: supportRowSelect,
       }),
+      // The soft-launch promos (docs/PLAN-promos.md §7): the partner reward, and the settled
+      // orders priced with a scrapbook bundle.
+      prisma.promoGrant.findUnique({
+        where: { userId_kind: { userId: user.id, kind: PARTNER_BOGO } },
+        select: {
+          reason: true,
+          createdAt: true,
+          usedAt: true,
+          sourceUser: { select: userSummarySelect },
+          usedByPayment: { select: { orderId: true } },
+        },
+      }),
+      prisma.payment.findMany({
+        where: { userId: user.id, bundles: { gt: 0 }, status: 'paid' },
+        orderBy: { paidAt: 'desc' },
+        take: 10,
+        select: { orderId: true, bundles: true, paidAt: true },
+      }),
     ])
 
     res.json({
       user: serializeAdminUser(await withUserCount(user)),
       partner: user.partner ? serializeUserSummary(user.partner) : null,
+      promos: {
+        partnerBogo: partnerReward
+          ? {
+              reason: partnerReward.reason,
+              earnedAt: partnerReward.createdAt.toISOString(),
+              usedAt: partnerReward.usedAt?.toISOString() ?? null,
+              usedByOrderId: partnerReward.usedByPayment?.orderId ?? null,
+              source: partnerReward.sourceUser
+                ? serializeUserSummary(partnerReward.sourceUser)
+                : null,
+            }
+          : null,
+        bundleOrders: bundleOrders.map((order) => ({
+          orderId: order.orderId,
+          bundles: order.bundles,
+          paidAt: order.paidAt?.toISOString() ?? null,
+        })),
+      },
       recent: {
         strips: strips.map(serializeAdminStrip),
         payments: (await withStripCounts(payments)).map(serializeAdminPayment),
@@ -834,6 +873,8 @@ adminRouter.get(
       createdAt: true,
       updatedAt: true,
       paidAt: true,
+      bogo: true,
+      bundles: true,
       user: { select: userSummarySelect },
     } as const
 

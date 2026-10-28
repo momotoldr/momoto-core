@@ -130,6 +130,28 @@ export interface Env {
    * §7a); this is the backstop, and what the presigned PUT signs as the most it allows.
    */
   scrapbookPdfMaxBytes: number
+  // ── Soft-launch promos (docs/PLAN-promos.md) ──
+  // Each promo has its own flag (user, 2026-10-27), and each flag is a total kill switch:
+  // off means no earning and no promo pricing. The FE has its own UI flag per promo.
+  /** Promo A, partner buy 1 get 1: links earn the reward and checkout spends it. */
+  partnerPromoEnabled: boolean
+  /** When links stop *earning* the reward. Rewards already earned stay usable. */
+  partnerPromoEndsAt: Date | null
+  /** How recently one of the two accounts must have been created for a link to earn it. */
+  promoNewAccountDays: number
+  /**
+   * Promo B, scrapbook bundle: one finished scrapbook + 3 unpaid strips in one checkout,
+   * at a discount (user, 2026-10-27).
+   */
+  bundlePromoEnabled: boolean
+  /**
+   * That discount, as a whole percentage off the four items' list price (user, 2026-10-27:
+   * 25%) — so it follows strip and scrapbook price changes. No default: with the flag on
+   * and this unset, the bundle counts as off (and boot logs a warning).
+   */
+  bundleDiscountPercent: number | null
+  /** When books go back to list price. */
+  bundleEndsAt: Date | null
   // ── Object storage (Cloudflare R2) ──
   /** R2 connection, or null when strip bytes should stay in Postgres. */
   r2: R2Config | null
@@ -244,6 +266,27 @@ function nonNegativeInt(name: string, raw: string | undefined, fallback: number)
     throw new Error(`Invalid ${name}: "${raw}" (expected a non-negative integer)`)
   }
   return n
+}
+
+/** An optional whole percentage, 1–99. Unset means null; anything else refuses to boot. */
+function optionalPercent(name: string, raw: string | undefined): number | null {
+  const n = optionalPositiveInt(name, raw)
+  if (n !== null && n >= 100) {
+    throw new Error(`Invalid ${name}: "${raw}" (expected a whole percentage from 1 to 99)`)
+  }
+  return n
+}
+
+/** An optional ISO date-time. Unset means null; anything unparseable refuses to boot. */
+function optionalDate(name: string, raw: string | undefined): Date | null {
+  if (raw === undefined || raw.trim() === '') return null
+  const date = new Date(raw.trim())
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(
+      `Invalid ${name}: "${raw}" (expected an ISO date-time, e.g. 2026-11-30T23:59:59+07:00)`,
+    )
+  }
+  return date
 }
 
 /** Require a non-empty secret from the environment (never hardcode secrets). */
@@ -456,5 +499,22 @@ export const env: Env = {
     process.env.SCRAPBOOK_PDF_MAX_BYTES,
     12 * 1024 * 1024,
   ),
+  partnerPromoEnabled: process.env.PARTNER_PROMO_ENABLED?.trim() === 'true',
+  partnerPromoEndsAt: optionalDate('PARTNER_PROMO_ENDS_AT', process.env.PARTNER_PROMO_ENDS_AT),
+  promoNewAccountDays: positiveInt('PROMO_NEW_ACCOUNT_DAYS', process.env.PROMO_NEW_ACCOUNT_DAYS, 7),
+  bundlePromoEnabled: process.env.BUNDLE_PROMO_ENABLED?.trim() === 'true',
+  bundleDiscountPercent: optionalPercent(
+    'BUNDLE_DISCOUNT_PERCENT',
+    process.env.BUNDLE_DISCOUNT_PERCENT,
+  ),
+  bundleEndsAt: optionalDate('BUNDLE_ENDS_AT', process.env.BUNDLE_ENDS_AT),
   r2: parseR2(),
+}
+
+// A warning, not a boot refusal — the same posture as SCRAPBOOK_PRICE_IDR: the rest of
+// checkout must keep working while one promo's price is missing.
+if (env.bundlePromoEnabled && env.bundleDiscountPercent === null) {
+  logger.warn('promos.bundlePriceUnset', {
+    msg: 'BUNDLE_PROMO_ENABLED is on but BUNDLE_DISCOUNT_PERCENT is unset; the bundle stays off.',
+  })
 }

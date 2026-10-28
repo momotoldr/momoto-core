@@ -97,6 +97,10 @@ export interface AdminPaymentInput {
   paidAt: Date | null
   /** Null once the payer deleted their account (the payment is kept). */
   user: UserSummaryInput | null
+  /** Priced with the partner buy 1 get 1 (docs/PLAN-promos.md). */
+  bogo: boolean
+  /** How many scrapbook bundles (one scrapbook + 3 strips) priced it. */
+  bundles: number
   _count: { strips: number; scrapbooks: number }
 }
 
@@ -110,8 +114,11 @@ export function serializeAdminPayment(p: AdminPaymentInput) {
     status: p.status,
     midtransStatus: p.midtransStatus,
     stripCount: p._count.strips,
-    // Non-zero for a scrapbook order (then `stripCount` is 0): the portal's item column.
+    // Strips and scrapbooks can share one order (since 2026-10-17): the portal's items column.
     scrapbookCount: p._count.scrapbooks,
+    // The promos that priced it, as tags beside the items (docs/PLAN-promos.md §7).
+    bogo: p.bogo,
+    bundled: p.bundles,
     user: p.user ? serializeUserSummary(p.user) : null,
     createdAt: p.createdAt.toISOString(),
     paidAt: p.paidAt ? p.paidAt.toISOString() : null,

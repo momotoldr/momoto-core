@@ -11,12 +11,12 @@ import { normalizeLang } from '../../notifications/lang.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
 import {
   cancelTransaction,
-  type ChargeItem,
   chargeTotal,
   chargeTransaction,
   isPaymentMethod,
   verifyNotificationSignature,
 } from '../../payments/midtrans.js'
+import { applyPromosOnSettlement, quoteOrder, sameQuote } from '../../promos/promos.js'
 import { asyncRoute } from '../asyncRoute.js'
 import { requireAuth } from '../middleware/requireAuth.js'
 import {
@@ -31,10 +31,12 @@ export const paymentsRouter = Router()
 
 /** Rate-limit checkout creation per user (each mints a Midtrans transaction). */
 const checkoutLimiter = new RateLimiter(20, 10 * 60_000)
+/** Quotes are re-asked on every change to the cart's selection, so a looser bound. */
+const quoteLimiter = new RateLimiter(240, 10 * 60_000)
 
 /** Reclaim expired checkout rate windows (wired into the periodic sweep). */
 export function sweepPaymentLimits(now: number = Date.now()): number {
-  return checkoutLimiter.sweep(now)
+  return checkoutLimiter.sweep(now) + quoteLimiter.sweep(now)
 }
 
 /**
@@ -58,6 +60,8 @@ function serializePayment(payment: {
   qrImageUrl: string | null
   deeplinkUrl: string | null
   expiresAt: Date | null
+  bogo: boolean
+  bundles: number
   strips: { id: string }[]
   scrapbooks: { id: string }[]
 }) {
@@ -80,6 +84,9 @@ function serializePayment(payment: {
     scrapbookIds: payment.scrapbooks.map((scrapbook) => scrapbook.id),
     // Strips only, as it always was: the cart's "n strips" line reads it.
     count: payment.strips.length,
+    // The promos it was priced with (docs/PLAN-promos.md), for the modal's summary.
+    bogo: payment.bogo,
+    bundled: payment.bundles,
   }
 }
 
@@ -92,6 +99,8 @@ const PAYMENT_SELECT = {
   qrImageUrl: true,
   deeplinkUrl: true,
   expiresAt: true,
+  bogo: true,
+  bundles: true,
   strips: { select: { id: true } },
   scrapbooks: { select: { id: true } },
 } as const
@@ -118,9 +127,12 @@ function findLivePayment(userId: string, now: Date = new Date()) {
  * order (user decision, 2026-10-17) — on the channel they picked. Body:
  * `{ stripIds?, scrapbookIds?, method }`, at least one id between them.
  *
- * The amount is `strips × STRIP_PRINT_PRICE_IDR + scrapbooks × SCRAPBOOK_PRICE_IDR`,
- * computed here and never trusted from the client, and sent to Midtrans as one line per
- * kind. Returns the artifacts our own checkout modal renders — a QR image, a wallet
+ * The amount is `strips × STRIP_PRINT_PRICE_IDR + scrapbooks × SCRAPBOOK_PRICE_IDR` with
+ * the soft-launch promos applied (`quoteOrder`, docs/PLAN-promos.md): one scrapbook + 3 of
+ * the order's unpaid strips at the bundle price, then two strips for one on an unused
+ * partner reward.
+ * Computed here and never trusted from the client, and sent to Midtrans as one line per
+ * kind. The promos are applied, not requested — each only lowers a line. Returns the artifacts our own checkout modal renders — a QR image, a wallet
  * deeplink, or both — rather than a hosted-popup token.
  *
  * Everything is checked before Midtrans is called, so an obvious refusal costs no
@@ -227,20 +239,8 @@ paymentsRouter.post(
       where: { id: userId },
       select: { displayName: true, email: true },
     })
-    const items: ChargeItem[] = [
-      {
-        id: 'strip-print',
-        name: 'Momoto strip print',
-        price: env.stripPrintPriceIdr,
-        quantity: stripIds.length,
-      },
-      {
-        id: 'scrapbook',
-        name: 'Momoto scrapbook',
-        price: scrapbookPrice ?? 0,
-        quantity: scrapbookIds.length,
-      },
-    ]
+    const quote = await quoteOrder(userId, stripIds.length, scrapbookIds.length)
+    const { items } = quote
     const grossAmount = chargeTotal(items)
     const orderId = `pay_${randomUUID()}`
 
@@ -256,6 +256,14 @@ paymentsRouter.post(
       for (const id of scrapbookIds) await lockScrapbook(tx, id)
       const refusal = await refuseScrapbooks(userId, scrapbookIds, tx)
       if (refusal) return { ok: false as const, refusal }
+      // The promos too: the Midtrans call took seconds, and the price it was opened at
+      // must still be the price. Anything that moved it (a reward spent by a late
+      // settlement, a promo switched off) abandons this attempt like any other refusal;
+      // the cart re-quotes on the retry.
+      const requote = await quoteOrder(userId, stripIds.length, scrapbookIds.length, tx)
+      if (!sameQuote(quote, requote)) {
+        return { ok: false as const, refusal: { status: 409, error: 'price_changed' } }
+      }
       const payment = await tx.payment.create({
         data: {
           orderId,
@@ -268,6 +276,8 @@ paymentsRouter.post(
           midtransStatus: charge.transactionStatus,
           // For the receipt the webhook sends: it has no request of the payer's to read.
           lang: normalizeLang(body.lang),
+          bogo: quote.bogo,
+          bundles: quote.bundles,
           strips: { connect: stripIds.map((id) => ({ id })) },
           scrapbooks: { connect: scrapbookIds.map((id) => ({ id })) },
         },
@@ -294,6 +304,8 @@ paymentsRouter.post(
       strips: stripIds.length,
       scrapbooks: scrapbookIds.length,
       grossAmount,
+      bogo: quote.bogo,
+      bundles: quote.bundles,
     })
     res.status(201).json(serializePayment(recorded.payment))
   }),
@@ -323,6 +335,55 @@ async function refuseScrapbooks(
   }
   return null
 }
+
+// ── POST /payments/quote ─── what a selection would cost, promos applied ──────
+/**
+ * The price `/charge` would ask for these items, with the soft-launch promos applied
+ * (docs/PLAN-promos.md): what the cart shows before anything is charged. The pricing is
+ * `quoteOrder`, the very function `/charge` runs, so the cart's total and the order's can't
+ * drift apart — the FE keeps no copy of the rules.
+ *
+ * Display only, and nothing is written: ids aren't checked for ownership or state here
+ * (that's `/charge`'s job) — the price depends only on how many of each there are and on
+ * the caller's partner reward. Body `{ stripIds?, scrapbookIds? }`. Answers
+ * `{ grossAmount, listAmount, bogo, bundles }`; amounts are null when a scrapbook is in it
+ * and its list price isn't set.
+ */
+paymentsRouter.post(
+  '/quote',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const userId = req.userId as string
+    if (!quoteLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
+    const body = req.body as { stripIds?: unknown; scrapbookIds?: unknown }
+    const stripIds = readIds(body.stripIds)
+    const scrapbookIds = readIds(body.scrapbookIds)
+    if (
+      !stripIds ||
+      !scrapbookIds ||
+      stripIds.length > MAX_CHECKOUT_STRIPS ||
+      scrapbookIds.length > env.scrapbookMaxItems
+    ) {
+      res.status(400).json({ error: 'invalid_input' })
+      return
+    }
+
+    const quote = await quoteOrder(userId, stripIds.length, scrapbookIds.length)
+    const priced = scrapbookIds.length === 0 || env.scrapbookPriceIdr !== null
+    res.json({
+      grossAmount: priced ? chargeTotal(quote.items) : null,
+      listAmount: priced
+        ? stripIds.length * env.stripPrintPriceIdr +
+          scrapbookIds.length * (env.scrapbookPriceIdr ?? 0)
+        : null,
+      bogo: quote.bogo,
+      bundles: quote.bundles,
+    })
+  }),
+)
 
 // ── GET /payments/pending ─── resume an attempt the user walked away from ────
 /**
@@ -483,6 +544,7 @@ paymentsRouter.post(
           where: { id: { in: scrapbookIds } },
           data: { paid: true, paidAt: now },
         })
+        await applyPromosOnSettlement(tx, payment, now)
         return true
       })
       if (!flipped) {
@@ -493,6 +555,8 @@ paymentsRouter.post(
         orderId,
         strips: stripIds.length,
         scrapbooks: scrapbookIds.length,
+        bogo: payment.bogo,
+        bundles: payment.bundles,
       })
 
       // Verified addresses only, as with the password mail: an operator-typed address
@@ -506,6 +570,10 @@ paymentsRouter.post(
           method: isPaymentMethod(payment.paymentType) ? payment.paymentType : null,
           stripCount: stripIds.length,
           scrapbookTitles: payment.scrapbooks.map((s) => s.title),
+          bogo: payment.bogo,
+          // Each bundle is one of these books with 3 of these strips; which ones doesn't
+          // matter, they're all priced alike.
+          bundled: payment.bundles,
         })
       }
     } else {
@@ -554,6 +622,8 @@ paymentsRouter.get(
           status: true,
           createdAt: true,
           paidAt: true,
+          bogo: true,
+          bundles: true,
           // The ids, not a count: the client already holds every strip it owns, so it
           // renders the row's thumbnails from its own store rather than us re-deriving
           // storage URLs here. Deleting a strip drops the join row, so this is "what
@@ -585,6 +655,8 @@ paymentsRouter.get(
         })),
         createdAt: row.createdAt.toISOString(),
         paidAt: row.paidAt?.toISOString() ?? null,
+        bogo: row.bogo,
+        bundled: row.bundles,
       })),
       // Never null: `_sum` is null when nothing matched, which is a zero total here.
       spent: settled._sum.grossAmount ?? 0,
