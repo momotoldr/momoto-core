@@ -66,13 +66,46 @@ const refreshLimiter = new RateLimiter(60, 60_000)
  * nothing against a password spray spread over many addresses, which is how
  * credential stuffing actually arrives.
  *
- * Only failures count and a success clears the counter, so a user who knows their
- * password is never affected. The residual trade-off is that someone who knows a
- * username can deliberately burn the budget and lock that account out for the
- * window — which is why this is a generous 10 per 15 minutes rather than a tight
- * lockout, and why it expires on its own instead of needing an unlock.
+ * Every attempt is counted *before* the password check and a success clears the
+ * counter, so in effect only failures count and a user who knows their password is
+ * never affected. Counting up front matters: argon2 takes ~100ms, and if the hit were
+ * only spent on the failure path, a burst of parallel guesses from many addresses
+ * would all pass the budget check before the first one failed.
+ *
+ * The residual trade-off is that someone who knows a username can deliberately burn
+ * the budget and lock that account out for the window — which is why this is a
+ * generous 10 per 15 minutes rather than a tight lockout, and why it expires on its
+ * own instead of needing an unlock.
  */
 const loginFailureLimiter = new RateLimiter(10, 15 * 60_000)
+/**
+ * Wrong current-password answers per *signed-in user*, on the routes that re-ask for
+ * it (`POST /auth/me/password`, `DELETE /auth/me`). Those exist so a session left on a
+ * shared device can't lock out or erase the owner — but without a budget, whoever holds
+ * that session could guess the password there, unthrottled. Same count-first,
+ * clear-on-success shape as `loginFailureLimiter`.
+ */
+const reauthFailureLimiter = new RateLimiter(10, 15 * 60_000)
+
+/**
+ * Checks a signed-in user's current password against `reauthFailureLimiter`. Answers
+ * 429 itself when the budget is spent and returns null; otherwise returns the verdict.
+ */
+async function verifyCurrentPassword(
+  res: Response,
+  userId: string,
+  hash: string,
+  plain: string,
+): Promise<boolean | null> {
+  if (!reauthFailureLimiter.allow(userId)) {
+    logger.warn('auth.reauth.locked', { userId })
+    res.status(429).json({ error: 'too_many_requests' })
+    return null
+  }
+  const ok = await verifyPassword(hash, plain)
+  if (ok) reauthFailureLimiter.reset(userId)
+  return ok
+}
 
 /**
  * Mail-sending endpoints, capped harder than the rest — every allowed call puts a
@@ -97,6 +130,7 @@ export function sweepAuthLimits(now: number = Date.now()): number {
     authLimiter.sweep(now) +
     refreshLimiter.sweep(now) +
     loginFailureLimiter.sweep(now) +
+    reauthFailureLimiter.sweep(now) +
     avatarLimiter.sweep(now) +
     emailClaimLimiter.sweep(now) +
     resendLimiter.sweep(now) +
@@ -290,10 +324,11 @@ authRouter.post(
       .toLowerCase()
     const password = String(req.body?.password ?? '')
 
-    // Per-account failure budget, checked without spending a hit (only failures below
-    // count). Answer 429 rather than 401 so a legitimate user learns to wait instead
-    // of retyping a password that would have worked.
-    if (!loginFailureLimiter.peek(username)) {
+    // Per-account failure budget. The hit is spent here, before argon2, so parallel
+    // guesses can't all slip past the check; a success below refunds it by clearing
+    // the counter. Answer 429 rather than 401 so a legitimate user learns to wait
+    // instead of retyping a password that would have worked.
+    if (!loginFailureLimiter.allow(username)) {
       logger.warn('auth.login.account_locked', { ipPrefix: ipPrefix(ip) })
       res.status(429).json({ error: 'too_many_requests' })
       return
@@ -308,7 +343,6 @@ authRouter.post(
       : await verifyDecoyPassword(password)
 
     if (!user || !ok) {
-      loginFailureLimiter.allow(username)
       res.status(401).json({ error: 'invalid_credentials' })
       return
     }
@@ -610,7 +644,13 @@ authRouter.post(
     // enough to lock the real owner out. A Google-only account has nothing to
     // re-supply, so for them this route *sets* a first password.
     if (user.passwordHash) {
-      const ok = await verifyPassword(user.passwordHash, String(req.body?.currentPassword ?? ''))
+      const ok = await verifyCurrentPassword(
+        res,
+        userId,
+        user.passwordHash,
+        String(req.body?.currentPassword ?? ''),
+      )
+      if (ok === null) return
       if (!ok) {
         res.status(403).json({ error: 'invalid_password' })
         return
@@ -1109,7 +1149,8 @@ authRouter.delete(
 
     if (user.passwordHash) {
       const password = String(req.body?.password ?? '')
-      const ok = await verifyPassword(user.passwordHash, password)
+      const ok = await verifyCurrentPassword(res, userId, user.passwordHash, password)
+      if (ok === null) return
       if (!ok) {
         res.status(403).json({ error: 'invalid_password' })
         return
