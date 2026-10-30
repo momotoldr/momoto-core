@@ -38,6 +38,15 @@ type Payload =
         bundled: number
       }
     }
+  | {
+      type: 'refund_confirmation'
+      data: {
+        orderId: string
+        amount: number
+        refundedAt: string
+        method: 'gopay' | 'shopeepay' | 'qris' | null
+      }
+    }
 
 /** How long to wait on the service before giving up. It only has to accept, not send. */
 const TIMEOUT_MS = 5_000
@@ -204,5 +213,25 @@ export function sendPaymentReceipt(
   return notify(to, lang, {
     type: 'payment_receipt',
     data: { ...order, paidAt: order.paidAt.toISOString() },
+  })
+}
+
+/**
+ * The refund of an order Midtrans settled but we never recorded as paid (an admin refund
+ * from the portal).
+ */
+export function sendRefundConfirmation(
+  to: string,
+  lang: Lang,
+  refund: {
+    orderId: string
+    amount: number
+    refundedAt: Date
+    method: 'gopay' | 'shopeepay' | 'qris' | null
+  },
+): Promise<boolean> {
+  return notify(to, lang, {
+    type: 'refund_confirmation',
+    data: { ...refund, refundedAt: refund.refundedAt.toISOString() },
   })
 }

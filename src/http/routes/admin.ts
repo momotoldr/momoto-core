@@ -23,8 +23,11 @@ import {
   isTestimonialFeature,
   markTestimonialsChanged,
 } from '../../lib/testimonials.js'
+import { sendRefundConfirmation } from '../../notifications/client.js'
+import { normalizeLang } from '../../notifications/lang.js'
 import {
   fetchTransactionStatus,
+  isPaymentMethod,
   midtransErrorMessage,
   midtransErrorStatus,
   refundTransaction,
@@ -1010,7 +1013,16 @@ adminRouter.post(
 
     const payment = await prisma.payment.findUnique({
       where: { id: req.params.id },
-      select: { id: true, orderId: true, status: true, midtransStatus: true },
+      select: {
+        id: true,
+        orderId: true,
+        status: true,
+        midtransStatus: true,
+        grossAmount: true,
+        paymentType: true,
+        lang: true,
+        user: { select: { email: true, emailVerifiedAt: true } },
+      },
     })
     if (!payment) {
       res.status(404).json({ error: 'not_found' })
@@ -1040,12 +1052,13 @@ adminRouter.post(
       return
     }
 
+    const refundedAt = new Date()
     const { count } = await prisma.payment.updateMany({
       where: { id: payment.id, status: payment.status },
       data: {
         status: 'refunded',
         midtransStatus: 'refund',
-        refundedAt: new Date(),
+        refundedAt,
         refundReason: reason,
         refundedById: req.userId,
       },
@@ -1090,6 +1103,17 @@ adminRouter.post(
       // `record`: refunded in the Midtrans dashboard already; nothing was paid out here.
       action,
     })
+    // Tell the payer, as the receipt would have: verified addresses only, and not awaited —
+    // the money is back either way. A recorded dashboard refund gets it too: an admin only
+    // records one for a payer who came to support about it.
+    if (payment.user?.email && payment.user.emailVerifiedAt) {
+      void sendRefundConfirmation(payment.user.email, normalizeLang(payment.lang), {
+        orderId: payment.orderId,
+        amount: payment.grossAmount,
+        refundedAt,
+        method: isPaymentMethod(payment.paymentType) ? payment.paymentType : null,
+      })
+    }
     const item = await prisma.payment.findUniqueOrThrow({
       where: { id: payment.id },
       select: paymentRowSelect,
