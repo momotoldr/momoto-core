@@ -4,7 +4,6 @@ import { serializeUser } from '../../auth/serialize.js'
 import { prisma } from '../../db/client.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
-import { markTestimonialsChanged } from '../../lib/testimonials.js'
 import { generateInviteCode } from '../../lib/inviteCode.js'
 import { grantPartnerPromo } from '../../promos/promos.js'
 import { asyncRoute } from '../asyncRoute.js'
@@ -133,34 +132,5 @@ partnerRouter.post(
       // So the accepter's UI can celebrate; the inviter finds out from GET /promos.
       promo: { partnerBogo: linked.earned.includes(me.id) ? 'earned' : null },
     })
-  }),
-)
-
-// ── DELETE /partner ─── unlink both accounts ───────────────────────────────────
-// Leaves any partner promo reward alone: it's once per account, earned or spent, and an
-// unlink must not make it available again (user, 2026-10-27).
-partnerRouter.delete(
-  '/',
-  asyncRoute(async (req, res) => {
-    const me = await prisma.user.findUnique({ where: { id: req.userId } })
-    if (!me) {
-      res.status(401).json({ error: 'unauthorized' })
-      return
-    }
-    if (me.partnerId) {
-      const partnerId = me.partnerId
-      await prisma.$transaction([
-        prisma.user.update({ where: { id: me.id }, data: { partnerId: null } }),
-        prisma.user.update({ where: { id: partnerId }, data: { partnerId: null } }),
-      ])
-      logger.info('partner.unlinked', { userId: me.id })
-      // A couple testimonial stops showing the partner the moment they unlink.
-      markTestimonialsChanged()
-    }
-    const updated = await prisma.user.findUnique({
-      where: { id: me.id },
-      include: { partner: true },
-    })
-    res.json({ user: updated ? serializeUser(updated) : null })
   }),
 )

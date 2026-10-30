@@ -107,7 +107,7 @@ async function loadPublished(): Promise<PublicTestimonial[]> {
 }
 
 /**
- * How long a snapshot stands when nothing has changed. Admin changes and partner unlinks
+ * How long a snapshot stands when nothing has changed. Admin changes and account deletions
  * don't wait for it — they bump `testimonialsRevision`, and a snapshot from an older
  * revision is never served. What this TTL bounds is the one thing that doesn't bump it: a
  * profile edit (a new name, picture or city) showing on a card.
