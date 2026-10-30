@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 // midtrans-client is CommonJS and its named exports aren't visible to Node's ESM
 // lexer, so import the default and destructure the classes at runtime; the type
 // names come from the ambient declaration via `import type`.
-import type { CoreApi as CoreApiType } from 'midtrans-client'
+import type { CoreApi as CoreApiType, MidtransError } from 'midtrans-client'
 import midtransClient from 'midtrans-client'
 
 import { env } from '../config/env.js'
@@ -181,4 +181,33 @@ export async function cancelTransaction(orderId: string): Promise<void> {
 /** Re-query a transaction's authoritative status straight from Midtrans. */
 export async function fetchTransactionStatus(orderId: string) {
   return getCore().transaction.status(orderId)
+}
+
+/**
+ * Refund a settled transaction in full, back to the wallet it was paid from. Midtrans
+ * only refunds `settlement`; the caller checks that first. `refundKey` makes a retry of
+ * the same refund safe: Midtrans refuses a second refund under it rather than paying
+ * twice. `reason` shows in the payer's GoPay history.
+ */
+export async function refundTransaction(
+  orderId: string,
+  params: { refundKey: string; reason: string },
+): Promise<void> {
+  await getCore().transaction.refund(orderId, {
+    refund_key: params.refundKey,
+    reason: params.reason,
+  })
+}
+
+/** The HTTP status a failed Midtrans call carried, or null if it never got an answer. */
+export function midtransErrorStatus(error: unknown): number | null {
+  const code = (error as Partial<MidtransError> | null)?.httpStatusCode
+  const n = typeof code === 'string' ? Number(code) : code
+  return typeof n === 'number' && Number.isFinite(n) ? n : null
+}
+
+/** Midtrans's own explanation of a failed call, for the operator, if it sent one. */
+export function midtransErrorMessage(error: unknown): string | null {
+  const message = (error as Partial<MidtransError> | null)?.ApiResponse?.status_message
+  return typeof message === 'string' && message ? message : null
 }

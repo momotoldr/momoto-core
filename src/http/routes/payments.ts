@@ -412,6 +412,9 @@ paymentsRouter.get(
   }),
 )
 
+/** Statuses no notification moves a payment out of. */
+const FINAL_STATUSES = ['paid', 'refunded']
+
 /**
  * Map a Midtrans `transaction_status` (+ `fraud_status`) to our Payment status.
  * `null` means "leave it as-is" (e.g. a `pending` we don't need to persist over an
@@ -430,6 +433,11 @@ function mapStatus(transactionStatus: string, fraudStatus?: string): string | nu
       return 'cancelled'
     case 'expire':
       return 'expired'
+    // A full refund made in the Midtrans dashboard on an order we never recorded as paid
+    // (the case an admin refund is for — see `Payment.refundedAt`). On a paid order it
+    // never gets this far: paid orders ignore every later notification.
+    case 'refund':
+      return 'refunded'
     case 'pending':
       return 'pending'
     default:
@@ -485,8 +493,10 @@ paymentsRouter.post(
       return
     }
 
-    // Idempotent: once paid, later notifications don't change entitlement.
-    if (payment.status === 'paid') {
+    // Idempotent: once paid, later notifications don't change entitlement. A refunded
+    // order is final the same way — a late settlement must not unlock what was given
+    // back, and Midtrans sends each refund twice.
+    if (payment.status === 'paid' || payment.status === 'refunded') {
       res.status(200).json({ ok: true })
       return
     }
@@ -532,7 +542,7 @@ paymentsRouter.post(
       // gets two.
       const flipped = await prisma.$transaction(async (tx) => {
         const { count } = await tx.payment.updateMany({
-          where: { orderId, status: { not: 'paid' } },
+          where: { orderId, status: { notIn: FINAL_STATUSES } },
           data: { status: 'paid', midtransStatus: transactionStatus, paidAt: now },
         })
         if (count === 0) return false
@@ -577,11 +587,17 @@ paymentsRouter.post(
         })
       }
     } else {
-      await prisma.payment.update({
-        where: { orderId },
-        data: { status: next, midtransStatus: transactionStatus },
+      // Conditional for the same reason as the flip above: an admin refund or a settlement
+      // can land between the read and this write, and neither may be overwritten.
+      const { count } = await prisma.payment.updateMany({
+        where: { orderId, status: { notIn: FINAL_STATUSES } },
+        data: {
+          status: next,
+          midtransStatus: transactionStatus,
+          ...(next === 'refunded' ? { refundedAt: new Date() } : {}),
+        },
       })
-      logger.info('payments.status', { orderId, status: next })
+      if (count > 0) logger.info('payments.status', { orderId, status: next })
     }
 
     res.status(200).json({ ok: true })

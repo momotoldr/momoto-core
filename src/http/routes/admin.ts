@@ -23,6 +23,12 @@ import {
   isTestimonialFeature,
   markTestimonialsChanged,
 } from '../../lib/testimonials.js'
+import {
+  fetchTransactionStatus,
+  midtransErrorMessage,
+  midtransErrorStatus,
+  refundTransaction,
+} from '../../payments/midtrans.js'
 import { PARTNER_BOGO } from '../../promos/promos.js'
 import { deleteImages } from '../../storage/objectStore.js'
 import { asyncRoute } from '../asyncRoute.js'
@@ -632,20 +638,7 @@ adminRouter.get(
         where: { userId: user.id },
         orderBy: { createdAt: 'desc' },
         take: 10,
-        select: {
-          id: true,
-          orderId: true,
-          grossAmount: true,
-          currency: true,
-          status: true,
-          midtransStatus: true,
-          createdAt: true,
-          updatedAt: true,
-          paidAt: true,
-          bogo: true,
-          bundles: true,
-          user: { select: userSummarySelect },
-        },
+        select: paymentRowSelect,
       }),
       prisma.feedback.findMany({
         where: { userId: user.id },
@@ -849,6 +842,26 @@ async function settledRevenue(
   return head + days + tail
 }
 
+/** The columns `serializeAdminPayment` needs (with `withStripCounts`). */
+const paymentRowSelect = {
+  id: true,
+  orderId: true,
+  grossAmount: true,
+  currency: true,
+  status: true,
+  midtransStatus: true,
+  createdAt: true,
+  updatedAt: true,
+  paidAt: true,
+  paymentType: true,
+  refundedAt: true,
+  refundReason: true,
+  refundedBy: { select: userSummarySelect },
+  bogo: true,
+  bundles: true,
+  user: { select: userSummarySelect },
+} as const
+
 // ── GET /admin/payments ─── transactions table + revenue for the filter ─────────
 //
 // `revenue` comes with the first batch only (no cursor) — a "load more" doesn't
@@ -863,25 +876,10 @@ adminRouter.get(
       ...(range ? { createdAt: range } : {}),
     }
 
-    const paymentSelect = {
-      id: true,
-      orderId: true,
-      grossAmount: true,
-      currency: true,
-      status: true,
-      midtransStatus: true,
-      createdAt: true,
-      updatedAt: true,
-      paidAt: true,
-      bogo: true,
-      bundles: true,
-      user: { select: userSummarySelect },
-    } as const
-
     const [rows, revenue] = await Promise.all([
       prisma.payment.findMany({
         where: { AND: [where, afterCursor(cursor)] },
-        select: paymentSelect,
+        select: paymentRowSelect,
         orderBy: newestFirst,
         take: limit + 1,
       }),
@@ -895,6 +893,209 @@ adminRouter.get(
       limit,
       ...(revenue !== null ? { revenue } : {}),
     })
+  }),
+)
+
+// ── Refunds: Midtrans took the money, we never recorded it ───────────────────────
+//
+// The one refund case: a payer was charged but the order reads failed/expired/pending
+// here, because the settlement notification was lost or came late, so nothing was
+// unlocked. A paid order is never refunded through the app. An admin first checks the
+// order with Midtrans, which is the only reliable source here, then refunds it in full
+// to the wallet it came from. If Midtrans never settled it, there is nothing for us to
+// refund: the wallet reverses its own failed deduction.
+
+/** Our statuses an admin refund can start from: none of them unlocked anything. */
+const REFUNDABLE_STATUSES = new Set(['pending', 'failed', 'expired', 'cancelled'])
+
+/** Midtrans keeps a refund `reason` to 255 characters. */
+const MAX_REFUND_REASON = 255
+
+/** The parts of Midtrans's view of an order the portal shows. */
+interface MidtransView {
+  status: string
+  paymentType: string | null
+  grossAmount: number | null
+  settledAt: string | null
+}
+
+/**
+ * Midtrans's current view of an order, or null when it has no such transaction (it was
+ * never charged there). Throws if Midtrans can't be asked, so a caller never mistakes an
+ * outage for "no money taken".
+ */
+async function midtransViewOf(orderId: string): Promise<MidtransView | null> {
+  try {
+    const t = (await fetchTransactionStatus(orderId)) as Record<string, unknown>
+    const gross = Number(t.gross_amount)
+    return {
+      status: typeof t.transaction_status === 'string' ? t.transaction_status : '',
+      paymentType: typeof t.payment_type === 'string' ? t.payment_type : null,
+      grossAmount: Number.isFinite(gross) ? gross : null,
+      settledAt: typeof t.settlement_time === 'string' ? t.settlement_time : null,
+    }
+  } catch (error) {
+    if (midtransErrorStatus(error) === 404) return null
+    throw error
+  }
+}
+
+/**
+ * What an admin can do with an order, given Midtrans's view of it: `refund` it (Midtrans
+ * settled money we never recorded), `record` a refund already made in the dashboard, or
+ * nothing.
+ */
+function refundActionFor(
+  status: string,
+  midtrans: MidtransView | null,
+): 'refund' | 'record' | null {
+  if (!REFUNDABLE_STATUSES.has(status) || !midtrans) return null
+  if (midtrans.status === 'settlement') return 'refund'
+  if (midtrans.status === 'refund') return 'record'
+  return null
+}
+
+/** Payments off means no Midtrans keys: answer that instead of throwing on the client. */
+function refusePaymentsDisabled(res: Response): boolean {
+  if (env.paymentsEnabled) return false
+  res.status(409).json({ error: 'payments_disabled' })
+  return true
+}
+
+// ── GET /admin/payments/:id/midtrans ─── ask Midtrans what really happened ───────────
+adminRouter.get(
+  '/payments/:id/midtrans',
+  asyncRoute(async (req, res) => {
+    if (refusePaymentsDisabled(res)) return
+    const payment = await prisma.payment.findUnique({
+      where: { id: req.params.id },
+      select: { orderId: true, status: true },
+    })
+    if (!payment) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+    let midtrans: MidtransView | null
+    try {
+      midtrans = await midtransViewOf(payment.orderId)
+    } catch (error) {
+      logger.warn('admin.payment.midtransCheckFailed', {
+        orderId: payment.orderId,
+        err: String(error),
+      })
+      res.status(502).json({ error: 'midtrans_unavailable' })
+      return
+    }
+    res.json({ midtrans, action: refundActionFor(payment.status, midtrans) })
+  }),
+)
+
+// ── POST /admin/payments/:id/refund ─── refund a settled order we never recorded ─────
+//
+// The row is claimed as `refunded` *before* Midtrans is asked to pay out, conditional on
+// the status we read. That is what keeps a settlement notification arriving meanwhile
+// from also unlocking the order: the webhook leaves a refunded order alone. If Midtrans
+// refuses, the claim is undone, unless Midtrans says the refund went through after all
+// (a timeout, or a retry after one).
+adminRouter.post(
+  '/payments/:id/refund',
+  asyncRoute(async (req, res) => {
+    if (refusePaymentsDisabled(res)) return
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const reason = typeof body.reason === 'string' ? body.reason.trim() : ''
+    if (!reason || reason.length > MAX_REFUND_REASON) {
+      res.status(400).json({ error: 'invalid_input' })
+      return
+    }
+
+    const payment = await prisma.payment.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, orderId: true, status: true, midtransStatus: true },
+    })
+    if (!payment) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+    if (!REFUNDABLE_STATUSES.has(payment.status)) {
+      res.status(409).json({ error: 'not_refundable' })
+      return
+    }
+
+    let midtrans: MidtransView | null
+    try {
+      midtrans = await midtransViewOf(payment.orderId)
+    } catch (error) {
+      logger.warn('admin.payment.midtransCheckFailed', {
+        orderId: payment.orderId,
+        err: String(error),
+      })
+      res.status(502).json({ error: 'midtrans_unavailable' })
+      return
+    }
+    const action = refundActionFor(payment.status, midtrans)
+    if (!action) {
+      res
+        .status(409)
+        .json({ error: 'midtrans_not_settled', midtransStatus: midtrans?.status ?? null })
+      return
+    }
+
+    const { count } = await prisma.payment.updateMany({
+      where: { id: payment.id, status: payment.status },
+      data: {
+        status: 'refunded',
+        midtransStatus: 'refund',
+        refundedAt: new Date(),
+        refundReason: reason,
+        refundedById: req.userId,
+      },
+    })
+    if (count === 0) {
+      res.status(409).json({ error: 'payment_changed' })
+      return
+    }
+
+    if (action === 'refund') {
+      try {
+        // One key per payment: a second refund of the same order is refused, never paid.
+        await refundTransaction(payment.orderId, { refundKey: `refund-${payment.id}`, reason })
+      } catch (error) {
+        const after = await midtransViewOf(payment.orderId).catch(() => null)
+        if (after?.status !== 'refund') {
+          await prisma.payment.updateMany({
+            where: { id: payment.id, status: 'refunded' },
+            data: {
+              status: payment.status,
+              midtransStatus: payment.midtransStatus,
+              refundedAt: null,
+              refundReason: null,
+              refundedById: null,
+            },
+          })
+          logger.warn('admin.payment.refundFailed', {
+            by: req.userId,
+            orderId: payment.orderId,
+            err: String(error),
+          })
+          res.status(502).json({ error: 'refund_failed', message: midtransErrorMessage(error) })
+          return
+        }
+      }
+    }
+
+    logger.info('admin.payment.refunded', {
+      by: req.userId,
+      orderId: payment.orderId,
+      from: payment.status,
+      // `record`: refunded in the Midtrans dashboard already; nothing was paid out here.
+      action,
+    })
+    const item = await prisma.payment.findUniqueOrThrow({
+      where: { id: payment.id },
+      select: paymentRowSelect,
+    })
+    const [serialized] = (await withStripCounts([item])).map(serializeAdminPayment)
+    res.json({ item: serialized })
   }),
 )
 
