@@ -47,6 +47,7 @@ type Payload =
         method: 'gopay' | 'shopeepay' | 'qris' | null
       }
     }
+  | { type: 'support_reply'; data: { ticket: string; message: string } }
 
 /** How long to wait on the service before giving up. It only has to accept, not send. */
 const TIMEOUT_MS = 5_000
@@ -234,4 +235,25 @@ export function sendRefundConfirmation(
     type: 'refund_confirmation',
     data: { ...refund, refundedAt: refund.refundedAt.toISOString() },
   })
+}
+
+/**
+ * An admin's answer to a support ticket, written in the admin console. Unlike the rest,
+ * its caller awaits this and checks it — the send is the whole action, so the console
+ * must hear when it didn't happen rather than record a reply nobody got.
+ */
+export function sendSupportReply(
+  to: string,
+  lang: Lang,
+  reply: { ticketNumber: number; message: string },
+): Promise<boolean> {
+  return notify(to, lang, {
+    type: 'support_reply',
+    data: { ticket: formatTicket(reply.ticketNumber), message: reply.message },
+  })
+}
+
+/** "SUP-0005" — the number as the admin console shows it (momoto-portal `formatTicket`). */
+function formatTicket(n: number): string {
+  return `SUP-${String(n).padStart(4, '0')}`
 }
