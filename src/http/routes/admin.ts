@@ -23,7 +23,7 @@ import {
   isTestimonialFeature,
   markTestimonialsChanged,
 } from '../../lib/testimonials.js'
-import { sendRefundConfirmation } from '../../notifications/client.js'
+import { sendRefundConfirmation, sendSupportReply } from '../../notifications/client.js'
 import { normalizeLang } from '../../notifications/lang.js'
 import {
   fetchTransactionStatus,
@@ -1315,7 +1315,80 @@ const supportRowSelect = {
   createdAt: true,
   resolvedAt: true,
   user: { select: userSummarySelect },
+  replies: {
+    orderBy: { createdAt: 'asc' },
+    select: {
+      id: true,
+      message: true,
+      sentTo: true,
+      createdAt: true,
+      sentBy: { select: userSummarySelect },
+    },
+  },
 } as const
+
+/** Matches momoto-notify's cap on `support_reply` messages. */
+const MAX_SUPPORT_REPLY = 5000
+
+// ── POST /admin/support/:id/replies ─── email the customer an answer ────────────
+// Sent through momoto-notify (Hostinger SMTP), in the ticket's language; replies to it
+// go to the support mailbox (SMTP_REPLY_TO), which is also blind-copied. The send is awaited: a reply is recorded only once notify accepted
+// it, and a refusal is a 502 so the admin knows nothing went out. `resolve: true` also
+// marks the ticket resolved, in the same step.
+adminRouter.post(
+  '/support/:id/replies',
+  asyncRoute(async (req, res) => {
+    const body = (req.body ?? {}) as { message?: unknown; resolve?: unknown }
+    const message = typeof body.message === 'string' ? body.message.trim() : ''
+    if (!message || message.length > MAX_SUPPORT_REPLY) {
+      res.status(400).json({ error: 'invalid_input' })
+      return
+    }
+    const resolve = body.resolve === true
+
+    const ticket = await prisma.supportTicket.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, ticketNumber: true, email: true, lang: true },
+    })
+    if (!ticket) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+    if (!ticket.email) {
+      res.status(400).json({ error: 'no_reply_address' })
+      return
+    }
+
+    const sent = await sendSupportReply(ticket.email, normalizeLang(ticket.lang), {
+      ticketNumber: ticket.ticketNumber,
+      message,
+    })
+    if (!sent) {
+      res.status(502).json({ error: 'notify_unavailable' })
+      return
+    }
+
+    await prisma.$transaction([
+      prisma.supportReply.create({
+        data: { ticketId: ticket.id, message, sentTo: ticket.email, sentById: req.userId },
+      }),
+      ...(resolve
+        ? [
+            prisma.supportTicket.updateMany({
+              where: { id: ticket.id, resolvedAt: null },
+              data: { resolvedAt: new Date() },
+            }),
+          ]
+        : []),
+    ])
+    const item = await prisma.supportTicket.findUniqueOrThrow({
+      where: { id: ticket.id },
+      select: supportRowSelect,
+    })
+    logger.info('admin.support.replied', { by: req.userId, ticketId: ticket.id, resolve })
+    res.status(201).json({ item: serializeAdminSupportTicket(item) })
+  }),
+)
 
 // ── PATCH /admin/support/:id ─── mark a ticket resolved / reopen it ─────────────
 adminRouter.patch(
