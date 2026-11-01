@@ -1,7 +1,7 @@
 /**
  * Minimal type surface for `midtrans-client` (the package ships no types). Covers only
  * what `src/payments/midtrans.ts` uses: CoreApi for charging a transaction on a single
- * channel, re-querying its status, and parsing notifications.
+ * channel, re-querying its status, refunding it, and parsing notifications.
  */
 declare module 'midtrans-client' {
   interface Config {
@@ -45,6 +45,12 @@ declare module 'midtrans-client' {
     [key: string]: unknown
   }
 
+  /** What a failed call rejects with: the HTTP (or Midtrans `status_code`) and the body. */
+  export interface MidtransError extends Error {
+    httpStatusCode: number | string | null
+    ApiResponse: { status_code?: string; status_message?: string; [key: string]: unknown } | null
+  }
+
   export class CoreApi {
     constructor(config: Config)
     /**
@@ -57,6 +63,11 @@ declare module 'midtrans-client' {
       notification(body: unknown): Promise<NotificationPayload>
       status(orderId: string): Promise<NotificationPayload>
       cancel(orderId: string): Promise<unknown>
+      /** Full refund when `amount` is left out. Resolves to the raw refund response. */
+      refund(
+        orderId: string,
+        parameter: { refund_key?: string; amount?: number; reason?: string },
+      ): Promise<unknown>
     }
   }
 
