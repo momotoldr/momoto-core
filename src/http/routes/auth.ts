@@ -1128,8 +1128,8 @@ authRouter.delete(
 // shouldn't be enough to erase an account. Google-only accounts have no password to
 // check — the valid session is the proof. Payments don't block it. The delete cascades
 // the user's strip rows, refresh tokens and partner invites, unlinks any partner, and
-// detaches feedback (kept for triage) and payments (the record of money received — there
-// are no refunds). The strips' images and the avatar live in object storage, which
+// detaches feedback (kept for triage) and payments (the record of money received — a paid
+// order is never refunded). The strips' images and the avatar live in object storage, which
 // doesn't cascade — they're deleted after.
 authRouter.delete(
   '/me',

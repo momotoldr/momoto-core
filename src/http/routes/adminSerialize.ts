@@ -95,6 +95,12 @@ export interface AdminPaymentInput {
   createdAt: Date
   updatedAt: Date
   paidAt: Date | null
+  /** gopay | shopeepay | qris — what a refund goes back to, and how long it can wait. */
+  paymentType: string | null
+  refundedAt: Date | null
+  refundReason: string | null
+  /** The admin who refunded it; null for a Midtrans-dashboard refund. */
+  refundedBy: UserSummaryInput | null
   /** Null once the payer deleted their account (the payment is kept). */
   user: UserSummaryInput | null
   /** Priced with the partner buy 1 get 1 (docs/PLAN-promos.md). */
@@ -122,6 +128,10 @@ export function serializeAdminPayment(p: AdminPaymentInput) {
     user: p.user ? serializeUserSummary(p.user) : null,
     createdAt: p.createdAt.toISOString(),
     paidAt: p.paidAt ? p.paidAt.toISOString() : null,
+    paymentType: p.paymentType,
+    refundedAt: p.refundedAt ? p.refundedAt.toISOString() : null,
+    refundReason: p.refundReason,
+    refundedBy: p.refundedBy ? serializeUserSummary(p.refundedBy) : null,
   }
 }
 

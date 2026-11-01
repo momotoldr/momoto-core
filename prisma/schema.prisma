@@ -95,7 +95,8 @@ model User {
   avatarImage        AvatarImage?
   strips             Strip[]
   scrapbooks         Scrapbook[]
-  payments           Payment[]
+  payments           Payment[]                @relation("PaymentOwner")
+  refundedPayments   Payment[]                @relation("PaymentRefundedBy")
   promoGrants        PromoGrant[]             @relation("PromoGrantOwner")
   promoGrantsSourced PromoGrant[]             @relation("PromoGrantSource")
   feedbacks          Feedback[]               @relation("FeedbackAuthor")
@@ -463,9 +464,9 @@ model Payment {
   /// Our Midtrans `order_id` (unique per attempt).
   orderId        String      @unique
   /// Null once the payer deleted their account: the payment stays as the record of money
-  /// received (there are no refunds), detached rather than deleted with them.
+  /// received (a paid order is never refunded), detached rather than deleted with them.
   userId         String?
-  user           User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  user           User?       @relation("PaymentOwner", fields: [userId], references: [id], onDelete: SetNull)
   /// The strips this checkout unlocks (implicit m-n) — all flipped paid on settlement.
   /// Empty once the payer's account is deleted (their strips go with it).
   strips         Strip[]
@@ -483,7 +484,7 @@ model Payment {
   bundles        Int         @default(0)
   grossAmount    Int
   currency       String      @default("IDR")
-  /// pending | paid | failed | expired | cancelled
+  /// pending | paid | failed | expired | cancelled | refunded
   status         String      @default("pending")
   /// Core API channel this order was charged on: gopay | shopeepay | qris.
   paymentType    String?
@@ -502,8 +503,21 @@ model Payment {
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
   paidAt         DateTime?
+  /// Refunds are for one case only: Midtrans took the money but we never recorded it as
+  /// paid (a lost or late settlement), so nothing was unlocked. An admin refunds it from
+  /// the portal, or a refund made in the Midtrans dashboard is recorded here. A paid
+  /// order is never refunded through the app. `refunded` is final: later notifications
+  /// for this order are ignored.
+  refundedAt     DateTime?
+  /// Why the admin refunded it (shown in the payer's GoPay history too). Null when the
+  /// refund came in from the Midtrans dashboard.
+  refundReason   String?
+  /// The admin who refunded it. Null for a dashboard refund, or once that account is gone.
+  refundedById   String?
+  refundedBy     User?       @relation("PaymentRefundedBy", fields: [refundedById], references: [id], onDelete: SetNull)
 
   @@index([userId])
+  @@index([refundedById])
   /// Keyset order for the admin transactions table (newest first, id breaks ties).
   @@index([createdAt, id])
   /// The transactions table filtered by status: newest-first within one status, so a
