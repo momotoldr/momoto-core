@@ -204,6 +204,15 @@ export interface AdminSupportTicketInput {
   createdAt: Date
   resolvedAt: Date | null
   user: UserSummaryInput | null
+  replies: AdminSupportReplyInput[]
+}
+
+export interface AdminSupportReplyInput {
+  id: string
+  message: string
+  sentTo: string
+  createdAt: Date
+  sentBy: UserSummaryInput | null
 }
 
 /** A help request for the admin support inbox. */
@@ -221,6 +230,13 @@ export function serializeAdminSupportTicket(t: AdminSupportTicketInput) {
     user: t.user ? serializeUserSummary(t.user) : null,
     createdAt: t.createdAt.toISOString(),
     resolvedAt: t.resolvedAt ? t.resolvedAt.toISOString() : null,
+    replies: t.replies.map((r) => ({
+      id: r.id,
+      message: r.message,
+      sentTo: r.sentTo,
+      sentBy: r.sentBy ? serializeUserSummary(r.sentBy) : null,
+      createdAt: r.createdAt.toISOString(),
+    })),
   }
 }
 

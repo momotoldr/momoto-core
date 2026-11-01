@@ -101,6 +101,7 @@ model User {
   promoGrantsSourced PromoGrant[]             @relation("PromoGrantSource")
   feedbacks          Feedback[]               @relation("FeedbackAuthor")
   supportTickets     SupportTicket[]          @relation("SupportTicketAuthor")
+  supportReplies     SupportReply[]           @relation("SupportReplySentBy")
   partnerFeedbacks   Feedback[]               @relation("FeedbackPartner")
   testimonials       Testimonial[]            @relation("TestimonialAuthor")
   featuredWith       Testimonial[]            @relation("TestimonialPartner")
@@ -192,12 +193,12 @@ model Feedback {
 /// 2026-10-10 both were rows of one table, told apart by `category`): its own ticket
 /// numbering, topic, status and reply address.
 model SupportTicket {
-  id                 String    @id @default(cuid())
+  id                 String         @id @default(cuid())
   /// Short, human-referenceable number (SUP-0005) an operator quotes back to the user.
   /// Tickets moved over from `Feedback` kept theirs; new ones continue after the highest.
-  ticketNumber       Int       @unique @default(autoincrement())
+  ticketNumber       Int            @unique @default(autoincrement())
   userId             String?
-  user               User?     @relation("SupportTicketAuthor", fields: [userId], references: [id], onDelete: SetNull)
+  user               User?          @relation("SupportTicketAuthor", fields: [userId], references: [id], onDelete: SetNull)
   /// What it's about ('session' | 'strip' | 'payment' | 'account' | 'other'), picked
   /// before the message is written. Null for requests sent before topics existed.
   topic              String?
@@ -212,11 +213,13 @@ model SupportTicket {
   userAgent          String?
   /// UI language when it was sent ('en' | 'id'), so a reply can match it.
   lang               String?
-  createdAt          DateTime  @default(now())
+  createdAt          DateTime       @default(now())
   /// When an admin marked it handled (null = still open). The acting admin is recorded
   /// in the server log, not here. 3 days after this the ticket is deleted
   /// (lib/supportRetention.ts); open tickets are kept however old.
   resolvedAt         DateTime?
+  /// Answers an admin emailed from the console, oldest first.
+  replies            SupportReply[]
 
   /// Keyset order for the admin support inbox (newest first, id breaks ties).
   @@index([createdAt, id])
@@ -225,6 +228,26 @@ model SupportTicket {
   @@index([resolvedAt, createdAt, id])
   /// A user's tickets: the admin users table count, user detail, account deletion.
   @@index([userId])
+}
+
+/// An answer to a support ticket, emailed to the ticket's address from the admin
+/// console (momoto-notify `support_reply`). Recorded only once notify accepted it, so a
+/// row means "sent" — what the customer writes back lands in the support mailbox, not
+/// here. Goes with its ticket when the ticket is deleted.
+model SupportReply {
+  id        String        @id @default(cuid())
+  ticketId  String
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  message   String
+  /// Where it went: the ticket's address at the time of sending.
+  sentTo    String
+  /// The admin who sent it; null once that account is gone.
+  sentById  String?
+  sentBy    User?         @relation("SupportReplySentBy", fields: [sentById], references: [id], onDelete: SetNull)
+  createdAt DateTime      @default(now())
+
+  @@index([ticketId, createdAt])
+  @@index([sentById])
 }
 
 /// A rating comment an admin has picked for the landing page's "What people say" section,
