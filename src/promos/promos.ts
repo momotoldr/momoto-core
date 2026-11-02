@@ -3,8 +3,15 @@ import type { Prisma } from '@prisma/client'
 import { env } from '../config/env.js'
 import { prisma } from '../db/client.js'
 import { logger } from '../lib/logger.js'
+import { enabledPaymentMethods, type PaymentMethod } from '../payments/midtrans.js'
 
-import { bundlePriceFor, partnerPromoEarners, priceOrder, type OrderPricing } from './pricing.js'
+import {
+  adminFeeFor,
+  bundlePriceFor,
+  partnerPromoEarners,
+  priceOrder,
+  type OrderPricing,
+} from './pricing.js'
 
 /**
  * The soft-launch promos' rules that need the database (docs/PLAN-promos.md). The money
@@ -87,16 +94,18 @@ export function currentBundlePrice(now: Date = new Date()): number | null {
 // ── Checkout and settlement ──────────────────────────────────────────────────
 
 /**
- * Price an order for this buyer, every promo they qualify for applied. Server-side and
- * never from the client, like every price here. Run twice per checkout — before the
- * Midtrans call and again under the scrapbook locks before recording — and the two
- * must agree (`sameQuote`). A bundle needs nothing but the counts; the reward is the only
- * thing read from the database.
+ * Price an order for this buyer, every promo they qualify for applied, plus `method`'s
+ * admin fee (none while no method is chosen yet). Server-side and never from the client,
+ * like every price here. Run twice per checkout — before the Midtrans call and again
+ * under the scrapbook locks before recording — and the two must agree (`sameQuote`). A
+ * bundle needs nothing but the counts; the reward is the only thing read from the
+ * database.
  */
 export async function quoteOrder(
   userId: string,
   stripCount: number,
   scrapbookCount: number,
+  method: PaymentMethod | null,
   db: Db = prisma,
 ): Promise<OrderPricing> {
   const bogo = stripCount >= 2 && (await hasUnusedPartnerReward(userId, db))
@@ -107,13 +116,26 @@ export async function quoteOrder(
     stripPrice: env.stripPrintPriceIdr,
     scrapbookPrice: env.scrapbookPriceIdr ?? 0,
     bundlePrice: currentBundlePrice(),
+    adminFee: method ? env.adminFees[method] : null,
   })
+}
+
+/**
+ * What each payment method's admin fee would add to an order costing `subtotal` after
+ * promos: the checkout modal shows it beside each method, before one is picked. Only the
+ * methods switched on here.
+ */
+export function adminFeesFor(subtotal: number): Partial<Record<PaymentMethod, number>> {
+  return Object.fromEntries(
+    enabledPaymentMethods().map((method) => [method, adminFeeFor(env.adminFees[method], subtotal)]),
+  )
 }
 
 /** Whether two quotes for the same order charge the same thing. */
 export function sameQuote(a: OrderPricing, b: OrderPricing): boolean {
   return (
-    JSON.stringify([a.items, a.bogo, a.bundles]) === JSON.stringify([b.items, b.bogo, b.bundles])
+    JSON.stringify([a.items, a.bogo, a.bundles, a.adminFee]) ===
+    JSON.stringify([b.items, b.bogo, b.bundles, b.adminFee])
   )
 }
 

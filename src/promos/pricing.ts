@@ -24,6 +24,28 @@ export function bundlePriceFor(
   return Math.max(1, Math.round((list * (100 - percent)) / 100))
 }
 
+/**
+ * The admin fee one payment method adds to an order: a flat amount, a percentage of the
+ * order after promos, or both (env `ADMIN_FEE_<METHOD>`). The percentage is in basis
+ * points — 0.7% is 70 — so the arithmetic stays in whole numbers.
+ */
+export interface AdminFeeRule {
+  /** Whole rupiah. */
+  flat: number
+  /** Hundredths of a percent. */
+  basisPoints: number
+}
+
+/**
+ * The admin fee on `subtotal` under `rule`, in whole rupiah. The percentage rounds **up**,
+ * so the fee never falls short of a channel's percentage cost. Promos never touch it
+ * (user, 2026-11-02): it is charged on what the items cost after their discounts.
+ */
+export function adminFeeFor(rule: AdminFeeRule | null, subtotal: number): number {
+  if (!rule || subtotal <= 0) return 0
+  return rule.flat + Math.ceil((subtotal * rule.basisPoints) / 10_000)
+}
+
 /** What an order holds, and which promos the caller has already found it qualifies for. */
 export interface OrderPricingInput {
   /** Unpaid strips in the order. */
@@ -36,6 +58,8 @@ export interface OrderPricingInput {
   scrapbookPrice: number
   /** One scrapbook + `BUNDLE_STRIPS` strips. Null while Promo B is off (flag, price, end). */
   bundlePrice: number | null
+  /** The chosen payment method's admin fee. Null (or absent) when none applies yet. */
+  adminFee?: AdminFeeRule | null
 }
 
 export interface OrderPricing {
@@ -45,6 +69,8 @@ export interface OrderPricing {
   bogo: boolean
   /** How many scrapbook bundles the order was priced with. */
   bundles: number
+  /** The admin fee line's amount, in whole rupiah; 0 when there is none. */
+  adminFee: number
 }
 
 /**
@@ -97,7 +123,16 @@ export function priceOrder(input: OrderPricingInput): OrderPricing {
       quantity: input.scrapbooks - bundles,
     },
   ]
-  return { items, bogo, bundles }
+  // Last, on the discounted subtotal: a promo lowers what the items cost, never the fee.
+  const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0)
+  const adminFee = adminFeeFor(input.adminFee ?? null, subtotal)
+  items.push({
+    id: 'admin-fee',
+    name: 'Admin fee',
+    price: adminFee,
+    quantity: adminFee > 0 ? 1 : 0,
+  })
+  return { items, bogo, bundles, adminFee }
 }
 
 /**

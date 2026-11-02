@@ -209,6 +209,8 @@ export function sendPaymentReceipt(
     bogo: boolean
     /** How many scrapbook bundles priced it: each one scrapbook + 3 of the strips. */
     bundled: number
+    /** The payment method's admin fee, already inside `grossAmount`; 0 for none. */
+    adminFee: number
   },
 ): Promise<boolean> {
   return notify(to, lang, {

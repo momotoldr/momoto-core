@@ -862,6 +862,7 @@ const paymentRowSelect = {
   refundedBy: { select: userSummarySelect },
   bogo: true,
   bundles: true,
+  adminFee: true,
   user: { select: userSummarySelect },
 } as const
 

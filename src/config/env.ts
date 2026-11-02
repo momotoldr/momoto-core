@@ -3,6 +3,8 @@
 import './loadEnv.js'
 
 import { logger } from '../lib/logger.js'
+import type { PaymentMethod } from '../payments/midtrans.js'
+import type { AdminFeeRule } from '../promos/pricing.js'
 
 export interface Env {
   port: number
@@ -73,14 +75,20 @@ export interface Env {
   /** Hit Midtrans production endpoints (vs sandbox). */
   midtransIsProduction: boolean
   /**
-   * Payment channels Snap may offer, in the order they appear. Empty = let Midtrans
-   * show everything the merchant account has active. Kept configurable because a
-   * channel must be activated per Midtrans environment: sandbox enables everything,
-   * production only what has been approved, so the two lists legitimately differ.
+   * Payment channels checkout offers (`enabledPaymentMethods`). `/charge` refuses any
+   * other, and the quote tells the cart which to show. Empty = every channel we support.
+   * Kept configurable because a channel must be activated per Midtrans environment —
+   * sandbox enables everything, production only what has been approved — and so one can
+   * be switched off without a release (ShopeePay, user 2026-11-02).
    */
   midtransEnabledPayments: string[]
   /** Price to unlock a strip's clean download/print, in whole rupiah. */
   stripPrintPriceIdr: number
+  /**
+   * The admin fee each payment method adds to an order (user, 2026-11-02), from
+   * `ADMIN_FEE_<METHOD>`. Null means that method charges none.
+   */
+  adminFees: Record<PaymentMethod, AdminFeeRule | null>
   /** True when PAYMENTS_ENABLED=true and both Midtrans keys are set. */
   paymentsEnabled: boolean
   /**
@@ -275,6 +283,30 @@ function optionalPercent(name: string, raw: string | undefined): number | null {
     throw new Error(`Invalid ${name}: "${raw}" (expected a whole percentage from 1 to 99)`)
   }
   return n
+}
+
+/**
+ * One payment method's admin fee: `1000` (flat rupiah), `0.7%` (of the order after
+ * promos, up to two decimals), or both as `1000+0.7%`. Unset or `0` means no fee;
+ * anything else refuses to boot.
+ */
+function optionalAdminFee(name: string, raw: string | undefined): AdminFeeRule | null {
+  if (raw === undefined || raw.trim() === '') return null
+  const rule: AdminFeeRule = { flat: 0, basisPoints: 0 }
+  const seen = new Set<string>()
+  for (const part of raw.split('+').map((p) => p.trim())) {
+    const percent = /^(\d{1,2}(?:\.\d{1,2})?)%$/.exec(part)
+    const kind = percent ? 'percent' : /^\d+$/.test(part) ? 'flat' : null
+    if (!kind || seen.has(kind)) {
+      throw new Error(
+        `Invalid ${name}: "${raw}" (expected rupiah, a percentage, or both — 1000, 0.7%, 1000+0.7%)`,
+      )
+    }
+    seen.add(kind)
+    if (percent) rule.basisPoints = Math.round(Number(percent[1]) * 100)
+    else rule.flat = Number(part)
+  }
+  return rule.flat === 0 && rule.basisPoints === 0 ? null : rule
 }
 
 /** An optional ISO date-time. Unset means null; anything unparseable refuses to boot. */
@@ -480,12 +512,15 @@ export const env: Env = {
   midtransServerKey: process.env.MIDTRANS_SERVER_KEY?.trim() || null,
   midtransClientKey: process.env.MIDTRANS_CLIENT_KEY?.trim() || null,
   midtransIsProduction: process.env.MIDTRANS_IS_PRODUCTION?.trim() === 'true',
-  // Defaults to the three QR/e-wallet channels — no cards, no VA, no convenience store.
-  midtransEnabledPayments: parseCsv(
-    process.env.MIDTRANS_ENABLED_PAYMENTS ?? 'gopay,shopeepay,qris',
-  ),
+  // ShopeePay is off by default until it's switched back on (user, 2026-11-02).
+  midtransEnabledPayments: parseCsv(process.env.MIDTRANS_ENABLED_PAYMENTS ?? 'gopay,qris'),
   // Whole rupiah (IDR has no minor unit). Default Rp8.999 per strip.
   stripPrintPriceIdr: positiveInt('STRIP_PRINT_PRICE_IDR', process.env.STRIP_PRINT_PRICE_IDR, 8999),
+  adminFees: {
+    gopay: optionalAdminFee('ADMIN_FEE_GOPAY', process.env.ADMIN_FEE_GOPAY),
+    shopeepay: optionalAdminFee('ADMIN_FEE_SHOPEEPAY', process.env.ADMIN_FEE_SHOPEEPAY),
+    qris: optionalAdminFee('ADMIN_FEE_QRIS', process.env.ADMIN_FEE_QRIS),
+  },
   // Explicit flag plus both Midtrans keys — so checkout can stay off even if keys exist.
   paymentsEnabled:
     process.env.PAYMENTS_ENABLED?.trim() === 'true' &&

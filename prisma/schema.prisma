@@ -505,6 +505,9 @@ model Payment {
   /// How many scrapbook bundles priced it (docs/PLAN-promos.md §2): each one finished
   /// scrapbook + 3 of its unpaid strips at the bundle price, as one Midtrans line.
   bundles        Int         @default(0)
+  /// The payment method's admin fee (`ADMIN_FEE_<METHOD>`, user 2026-11-02), whole rupiah,
+  /// already inside `grossAmount` as its own Midtrans line. 0 for none.
+  adminFee       Int         @default(0)
   grossAmount    Int
   currency       String      @default("IDR")
   /// pending | paid | failed | expired | cancelled | refunded
