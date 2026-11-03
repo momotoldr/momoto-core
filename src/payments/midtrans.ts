@@ -40,6 +40,15 @@ export function isPaymentMethod(value: unknown): value is PaymentMethod {
   return typeof value === 'string' && (PAYMENT_METHODS as readonly string[]).includes(value)
 }
 
+/**
+ * The channels switched on in this environment (`MIDTRANS_ENABLED_PAYMENTS`), in our
+ * order. A name we don't support is ignored; an empty list means all of them.
+ */
+export function enabledPaymentMethods(): PaymentMethod[] {
+  const on = env.midtransEnabledPayments
+  return PAYMENT_METHODS.filter((method) => on.length === 0 || on.includes(method))
+}
+
 /** One line on the Midtrans receipt: strips at their price, scrapbooks at theirs. */
 export interface ChargeItem {
   /** The line item's id: `strip-print` or `scrapbook`. */
