@@ -107,6 +107,8 @@ export interface AdminPaymentInput {
   bogo: boolean
   /** How many scrapbook bundles (one scrapbook + 3 strips) priced it. */
   bundles: number
+  /** The payment method's admin fee, already inside `grossAmount`; 0 for none. */
+  adminFee: number
   _count: { strips: number; scrapbooks: number }
 }
 
@@ -125,6 +127,7 @@ export function serializeAdminPayment(p: AdminPaymentInput) {
     // The promos that priced it, as tags beside the items (docs/PLAN-promos.md §7).
     bogo: p.bogo,
     bundled: p.bundles,
+    adminFee: p.adminFee,
     user: p.user ? serializeUserSummary(p.user) : null,
     createdAt: p.createdAt.toISOString(),
     paidAt: p.paidAt ? p.paidAt.toISOString() : null,

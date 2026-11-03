@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import {
+  adminFeeFor,
   bundlePriceFor,
   partnerPromoEarners,
   priceOrder,
@@ -112,6 +113,42 @@ describe('priceOrder', () => {
           assert.ok(promo <= strips * STRIP + scrapbooks * BOOK)
           assert.ok(promo >= 0)
         }
+  })
+})
+
+describe('admin fee', () => {
+  const QRIS = { flat: 0, basisPoints: 70 } // 0.7%
+
+  it('is its own line on top of the items', () => {
+    const pricing = priceOrder(order({ strips: 2, adminFee: { flat: 1_000, basisPoints: 0 } }))
+    assert.equal(pricing.adminFee, 1_000)
+    assert.equal(total({ strips: 2, adminFee: { flat: 1_000, basisPoints: 0 } }), 2 * STRIP + 1_000)
+    assert.deepEqual(lines({ strips: 2, adminFee: { flat: 1_000, basisPoints: 0 } }), {
+      'strip-print': 2,
+      'admin-fee': 1,
+    })
+  })
+
+  it('takes its percentage of the discounted amount, not list price', () => {
+    // Bundle Rp 47,997 × 0.7% = 335.979 → 336.
+    assert.equal(priceOrder(order({ strips: 3, scrapbooks: 1, adminFee: QRIS })).adminFee, 336)
+    // Buy 1 get 1: Rp 12,999 × 0.7% = 90.993 → 91.
+    assert.equal(priceOrder(order({ strips: 2, bogo: true, adminFee: QRIS })).adminFee, 91)
+  })
+
+  it('rounds the percentage up to the whole rupiah', () => {
+    assert.equal(adminFeeFor(QRIS, 1_000), 7)
+    assert.equal(adminFeeFor(QRIS, 1_001), 8)
+    assert.equal(adminFeeFor({ flat: 500, basisPoints: 200 }, 12_999), 500 + 260)
+  })
+
+  it('adds no line when there is no fee', () => {
+    assert.equal(priceOrder(order({ strips: 2 })).adminFee, 0)
+    assert.deepEqual(lines({ strips: 2, adminFee: null }), { 'strip-print': 2 })
+  })
+
+  it('charges nothing on an empty order', () => {
+    assert.equal(adminFeeFor({ flat: 1_000, basisPoints: 70 }, 0), 0)
   })
 })
 
