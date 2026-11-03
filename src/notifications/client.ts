@@ -48,6 +48,10 @@ type Payload =
       }
     }
   | { type: 'support_reply'; data: { ticket: string; message: string } }
+  | {
+      type: 'inactive_warning'
+      data: { username: string; deleteOn: string; daysLeft: number; signInUrl: string }
+    }
 
 /** How long to wait on the service before giving up. It only has to accept, not send. */
 const TIMEOUT_MS = 5_000
@@ -252,6 +256,27 @@ export function sendSupportReply(
   return notify(to, lang, {
     type: 'support_reply',
     data: { ticket: formatTicket(reply.ticketNumber), message: reply.message },
+  })
+}
+
+/**
+ * The notice that an account nobody has opened in a while is about to be deleted
+ * (lib/inactiveAccounts.ts). Its caller awaits this: a warning that never left must
+ * not be recorded as sent, or the account would be deleted without the notice.
+ */
+export function sendInactiveWarning(
+  to: string,
+  lang: Lang,
+  warning: { username: string; deleteOn: Date; daysLeft: number },
+): Promise<boolean> {
+  return notify(to, lang, {
+    type: 'inactive_warning',
+    data: {
+      username: warning.username,
+      deleteOn: warning.deleteOn.toISOString(),
+      daysLeft: warning.daysLeft,
+      signInUrl: `${env.appBaseUrl}/login`,
+    },
   })
 }
 

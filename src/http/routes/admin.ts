@@ -13,6 +13,7 @@ import {
   metricTotals,
   utcDaysAgo,
 } from '../../lib/dailyStats.js'
+import { deleteAccount } from '../../lib/deleteAccount.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
 import {
@@ -33,7 +34,6 @@ import {
   refundTransaction,
 } from '../../payments/midtrans.js'
 import { PARTNER_BOGO } from '../../promos/promos.js'
-import { deleteImages } from '../../storage/objectStore.js'
 import { asyncRoute } from '../asyncRoute.js'
 import { requireAdmin } from '../middleware/requireAdmin.js'
 import { requireAuth } from '../middleware/requireAuth.js'
@@ -46,8 +46,6 @@ import {
   serializeAdminUser,
   serializeUserSummary,
 } from './adminSerialize.js'
-import { deleteScrapbookObjects, scrapbookObjectsOf } from './scrapbooks.js'
-import { deleteStripObjects } from './strips.js'
 
 /** Session modes the app records — the single list every mode filter reads. */
 const SESSION_MODES = new Set(['solo', 'date', 'group'])
@@ -94,6 +92,11 @@ const userRowSelect = {
   cityName: true,
   createdAt: true,
   updatedAt: true,
+  // The inactive-account schedule (lib/inactiveAccounts.ts `inactivitySchedule`).
+  emailVerifiedAt: true,
+  lastActiveAt: true,
+  inactiveWarnedAt: true,
+  inactiveFinalAt: true,
 } as const
 
 // ── Related-row counts ────────────────────────────────────────────────────────
@@ -723,7 +726,7 @@ adminRouter.delete(
 
     const target = await prisma.user.findUnique({
       where: { id },
-      select: { id: true, avatarKey: true, _count: { select: { payments: true } } },
+      select: { id: true, _count: { select: { payments: true } } },
     })
     if (!target) {
       res.status(404).json({ error: 'not_found' })
@@ -734,25 +737,7 @@ adminRouter.delete(
       return
     }
 
-    // Strip rows cascade with the account, but the images they point at live in
-    // object storage and don't — collect the keys before the rows are gone. Same for
-    // the avatar, whose key came back on `target` above.
-    const strips = await prisma.strip.findMany({
-      where: { userId: id },
-      select: {
-        storageKey: true,
-        thumbnailKey: true,
-        printImage: { select: { storageKey: true } },
-      },
-    })
-    const scrapbooks = await scrapbookObjectsOf(target.id)
-
-    await prisma.user.delete({ where: { id } })
-    // Their testimonials cascaded away (or dropped them as a partner) — refresh the landing cache.
-    markTestimonialsChanged()
-    await deleteStripObjects(strips)
-    await deleteScrapbookObjects(scrapbooks)
-    if (target.avatarKey) await deleteImages('avatar', [target.avatarKey])
+    await deleteAccount(target.id, 'admin')
     logger.info('admin.user.deleted', { by: req.userId, userId: id })
     res.json({ ok: true })
   }),

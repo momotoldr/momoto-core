@@ -26,11 +26,12 @@ import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
 import { clientIp, rateLimitKey } from '../../lib/clientIp.js'
 import { isValidEmail, normalizeEmail } from '../../lib/email.js'
+import { noteActivity } from '../../lib/activity.js'
+import { deleteAccount } from '../../lib/deleteAccount.js'
 import { ipPrefix } from '../../lib/ipPrefix.js'
 import { parseLocation } from '../../lib/locations.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
-import { markTestimonialsChanged } from '../../lib/testimonials.js'
 import { sendPasswordChanged } from '../../notifications/client.js'
 import { normalizeLang } from '../../notifications/lang.js'
 import {
@@ -48,8 +49,6 @@ import { signUploadGrant, verifyUploadGrant } from '../../storage/uploadGrant.js
 import { asyncRoute } from '../asyncRoute.js'
 import { readImageSize, sniffImageType } from '../imageType.js'
 import { requireAuth } from '../middleware/requireAuth.js'
-import { deleteScrapbookObjects, scrapbookObjectsOf } from './scrapbooks.js'
-import { deleteStripObjects } from './strips.js'
 
 export const authRouter = Router()
 
@@ -209,9 +208,18 @@ function refreshCookieOptions(expiresAt?: Date): CookieOptions {
   }
 }
 
-/** Issues a fresh session (refresh cookie + access token) and returns the payload. */
-async function establishSession(res: Response, userId: string): Promise<{ accessToken: string }> {
+/**
+ * Issues a fresh session (refresh cookie + access token) and returns the payload. Every
+ * new session is activity for the inactive-account clock; `rawLang` is the request's
+ * `lang`, when it sent one (see lib/activity.ts).
+ */
+async function establishSession(
+  res: Response,
+  userId: string,
+  rawLang?: unknown,
+): Promise<{ accessToken: string }> {
   const { raw, expiresAt } = await issueRefreshToken(userId)
+  noteActivity(userId, rawLang)
   res.cookie(REFRESH_COOKIE, raw, refreshCookieOptions(expiresAt))
   return { accessToken: signAccessToken(userId) }
 }
@@ -307,7 +315,7 @@ authRouter.post(
     // successful signup into an error. `sendMail` already swallows its own failures.
     await claimEmail(user.id, email, lang)
 
-    const { accessToken } = await establishSession(res, user.id)
+    const { accessToken } = await establishSession(res, user.id, req.body?.lang)
     res.status(201).json({ user: serializeUser(user, email), accessToken })
   }),
 )
@@ -348,7 +356,7 @@ authRouter.post(
     }
 
     loginFailureLimiter.reset(username)
-    const { accessToken } = await establishSession(res, user.id)
+    const { accessToken } = await establishSession(res, user.id, req.body?.lang)
     res.json({ user: serializeUser(user), accessToken })
   }),
 )
@@ -449,7 +457,7 @@ authRouter.post(
     }
     logger.info('auth.google', { userId: user.id })
 
-    const { accessToken } = await establishSession(res, user.id)
+    const { accessToken } = await establishSession(res, user.id, req.body?.lang)
     res.json({ user: serializeUser(user), accessToken })
   }),
 )
@@ -484,6 +492,9 @@ authRouter.post(
       res.status(401).json({ error: 'unauthorized' })
       return
     }
+    // A refresh is the app being opened (or kept open) signed in. Throttled to one write
+    // a day inside, so the hourly-per-tab rate doesn't reach the database.
+    noteActivity(user.id, req.body?.lang)
     // Carry `pendingEmail` on the refresh path too. It costs one indexed lookup per
     // access-token expiry (an hour, per tab), and without it a refresh would quietly
     // replace the store's user with one that has forgotten it is mid-verification —
@@ -666,7 +677,7 @@ authRouter.post(
     // to evict anyone else holding a session, not to log the user out of the tab
     // they just used to succeed.
     const revoked = await revokeAllForUser(userId)
-    const { accessToken } = await establishSession(res, userId)
+    const { accessToken } = await establishSession(res, userId, req.body?.lang)
     logger.info('auth.password.changed', { userId, sessionsRevoked: revoked })
 
     // **The one mail that tells a victim something happened.** Revoking every session
@@ -1126,11 +1137,9 @@ authRouter.delete(
 // Self-service account deletion. For an account that has a password, we re-verify
 // it here: an access token alone (which could be lingering on a shared device)
 // shouldn't be enough to erase an account. Google-only accounts have no password to
-// check — the valid session is the proof. Payments don't block it. The delete cascades
-// the user's strip rows, refresh tokens and partner invites, unlinks any partner, and
-// detaches feedback (kept for triage) and payments (the record of money received — a paid
-// order is never refunded). The strips' images and the avatar live in object storage, which
-// doesn't cascade — they're deleted after.
+// check — the valid session is the proof. Payments don't block it. What the delete
+// removes and detaches is `deleteAccount`'s job (lib/deleteAccount.ts), shared with the
+// admin route and the inactive-account job.
 authRouter.delete(
   '/me',
   requireAuth,
@@ -1138,9 +1147,7 @@ authRouter.delete(
     const userId = req.userId as string
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      // `avatarKey` because the row cascades away but the object it names doesn't —
-      // read it while the row still exists.
-      select: { passwordHash: true, avatarKey: true },
+      select: { passwordHash: true },
     })
     if (!user) {
       res.status(401).json({ error: 'unauthorized' })
@@ -1157,28 +1164,7 @@ authRouter.delete(
       }
     }
 
-    // Strip rows cascade with the account, but the images they point at don't — collect
-    // the keys before the rows are gone, as `DELETE /admin/users/:id` does. Without this,
-    // every self-deleted account left its strips in both buckets with no row naming them.
-    const strips = await prisma.strip.findMany({
-      where: { userId },
-      select: {
-        storageKey: true,
-        thumbnailKey: true,
-        printImage: { select: { storageKey: true } },
-      },
-    })
-    // Scrapbooks likewise: a PDF in the private bucket and a cover in the public one each.
-    const scrapbooks = await scrapbookObjectsOf(userId)
-
-    await prisma.user.delete({ where: { id: userId } })
-    // Their testimonials cascaded away (or dropped them as a partner) — refresh the landing cache.
-    markTestimonialsChanged()
-    // Best-effort, after the row is gone: a failure is logged, and the account is deleted
-    // either way.
-    await deleteStripObjects(strips)
-    await deleteScrapbookObjects(scrapbooks)
-    if (user.avatarKey) await deleteImages('avatar', [user.avatarKey])
+    await deleteAccount(userId, 'self')
     res.clearCookie(REFRESH_COOKIE, refreshCookieOptions())
     logger.info('auth.account.deleted', { userId })
     res.status(204).end()
