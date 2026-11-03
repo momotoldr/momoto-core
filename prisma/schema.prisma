@@ -25,8 +25,8 @@ enum Role {
 /// A registered user. `passwordHash` is null for Google-only accounts; `googleId`
 /// is null for email/password-only accounts (an account can have both once linked).
 model User {
-  id              String    @id @default(cuid())
-  username        String    @unique
+  id               String    @id @default(cuid())
+  username         String    @unique
   /// The account's **proven** address, or null. Accounts sign in with a username;
   /// this is how they get back in when the password is gone.
   ///
@@ -36,24 +36,24 @@ model User {
   /// Google sign-in (`auth/google.ts` rejects a token without `email_verified`, so
   /// Google did the proving) and `POST /admin/users`, where an operator types it and
   /// `emailVerifiedAt` is therefore left null.
-  email           String?   @unique
+  email            String?   @unique
   /// When `email` was proven. Null means the address is unproven, not absent —
   /// an admin-minted account has one and hasn't confirmed it.
   ///
   /// This gates exactly one thing: whether a password-reset link may be mailed.
   /// It does **not** gate sign-in, the booth, or checkout; an unproven address costs
   /// the user a banner, never access.
-  emailVerifiedAt DateTime?
-  passwordHash    String?
-  displayName     String
+  emailVerifiedAt  DateTime?
+  passwordHash     String?
+  displayName      String
   /// A picture hosted elsewhere. **Set by Google sign-in only** — users upload
   /// through `avatarImage` instead, so this is never an arbitrary user-supplied URL
   /// (which would load in the partner's browser and leak their IP to its host).
-  avatarUrl       String?
+  avatarUrl        String?
   /// When the uploaded avatar last changed. A plain column rather than a lookup
   /// through the relation, so serializing a user never needs the image bytes: it is
   /// both the "has an upload" flag and the cache-buster in the avatar URL.
-  avatarUpdatedAt DateTime?
+  avatarUpdatedAt  DateTime?
   /// Object-storage key for the uploaded avatar, in the **public** bucket.
   ///
   /// On the user row rather than on `AvatarImage` for one reason: `serializeUser` is
@@ -65,22 +65,35 @@ model User {
   /// Null means "no uploaded avatar in the bucket" — either the user has none at all
   /// (`avatarUpdatedAt` is null too) or theirs is a pre-storage row whose bytes are
   /// still in `avatarImage` (see that model).
-  avatarKey       String?
-  googleId        String?   @unique
+  avatarKey        String?
+  googleId         String?   @unique
   /// Privilege level. Defaults to USER; ADMIN is set only via `npm run make-admin`.
-  role            Role      @default(USER)
+  role             Role      @default(USER)
   /// Where the person lives, set only by them on their profile. Null = not given.
   /// ISO 3166-1 alpha-2; 'ID' always comes with a `regionCode`. Shown publicly only on a
   /// testimonial an admin publishes. The three columns are kept consistent by CHECK
   /// constraints in the migration, not just by `PATCH /auth/me`.
-  countryCode     String?
+  countryCode      String?
   /// Kemendagri kabupaten/kota code ("32.73"), from `src/data/regions-id.json`. Set
   /// exactly when `countryCode` is 'ID'.
-  regionCode      String?
+  regionCode       String?
   /// Free-text city abroad ("Tokyo"). Only when `countryCode` isn't 'ID'; optional.
-  cityName        String?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  cityName         String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  /// Last time the person opened the app signed in (login, register, Google, refresh),
+  /// written at most once a day by `touchActivity` (lib/activity.ts). The only input to
+  /// the inactive-account deletion (docs/PLAN-inactive-accounts.md). Existing rows were
+  /// backfilled to the migration's time, so everyone's clock started at that deploy.
+  lastActiveAt     DateTime  @default(now())
+  /// When the first inactivity warning (14 days before deletion) was mailed. Cleared by
+  /// any activity, which cancels the deletion.
+  inactiveWarnedAt DateTime?
+  /// When the final inactivity warning (3 days before) was mailed. Cleared by activity.
+  inactiveFinalAt  DateTime?
+  /// UI language at the last sign-in, so a mail sent with no request behind it (the
+  /// inactivity warning) still matches. Null = English.
+  lang             String?
 
   // Partner linking — a mutual one-to-one couple link (see partner routes). When
   // linked, both users' partnerId point at each other; unlinking clears both.
@@ -109,6 +122,8 @@ model User {
 
   /// Keyset order for the admin users table (newest first, id breaks ties).
   @@index([createdAt, id])
+  /// The inactive-account job walks accounts by last activity, in keyset batches.
+  @@index([lastActiveAt, id])
   /// Trigram indexes for the admin user search (`ILIKE '%q%'`), so finding one account
   /// is an index lookup instead of a full scan. Needs the pg_trgm extension (created in
   /// migration 20261010010000) and a search of 3+ characters — see admin `/users`.

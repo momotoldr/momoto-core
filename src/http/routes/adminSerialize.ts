@@ -7,6 +7,7 @@
  * no `passwordHash`, no `tokenHash`, no strip/avatar image bytes. Everything here
  * operates on already-`select`ed shapes, so the bytes are never even loaded.
  */
+import { inactivitySchedule, type InactivitySchedule } from '../../lib/inactiveAccounts.js'
 import { placeLabel } from '../../lib/locations.js'
 import { coupleStatus, isEligibleFeedback } from '../../lib/testimonials.js'
 import { publicUrl } from '../../storage/objectStore.js'
@@ -56,6 +57,10 @@ export interface AdminUserRowInput {
   cityName: string | null
   createdAt: Date
   updatedAt: Date
+  emailVerifiedAt: Date | null
+  lastActiveAt: Date
+  inactiveWarnedAt: Date | null
+  inactiveFinalAt: Date | null
   _count: { strips: number; payments: number; feedbacks: number; supportTickets: number }
 }
 
@@ -75,12 +80,24 @@ export function serializeAdminUser(u: AdminUserRowInput) {
     location: placeLabel(u),
     createdAt: u.createdAt.toISOString(),
     updatedAt: u.updatedAt.toISOString(),
+    /** Last sign-in or refresh, day precision (lib/activity.ts). */
+    lastActiveAt: u.lastActiveAt.toISOString(),
+    inactivity: serializeSchedule(inactivitySchedule(u)),
     counts: {
       strips: u._count.strips,
       payments: u._count.payments,
       feedbacks: u._count.feedbacks,
       supportTickets: u._count.supportTickets,
     },
+  }
+}
+
+function serializeSchedule(schedule: InactivitySchedule) {
+  return {
+    state: schedule.state,
+    warnOn: schedule.warnOn?.toISOString() ?? null,
+    deleteOn: schedule.deleteOn?.toISOString() ?? null,
+    enabled: schedule.enabled,
   }
 }
 
