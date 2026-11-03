@@ -160,6 +160,22 @@ export interface Env {
   bundleDiscountPercent: number | null
   /** When books go back to list price. */
   bundleEndsAt: Date | null
+  // ── Inactive-account deletion (docs/PLAN-inactive-accounts.md) ──
+  /**
+   * Whether the hourly job actually warns and deletes. Off by default: the job then only
+   * logs how many accounts it *would* warn and delete (`inactive.dryrun`), so the real
+   * numbers are visible before anything is switched on.
+   */
+  inactiveDeleteEnabled: boolean
+  /** Days without activity before an account with a verified email is deleted. */
+  inactiveDeleteDays: number
+  /**
+   * Days without activity before an account with no verified email is deleted. It can't
+   * be warned, so it gets longer (user, 2026-11-03: 180).
+   */
+  inactiveDeleteSilentDays: number
+  /** Most accounts deleted per hourly run, so a first enable spreads its R2 deletes out. */
+  inactiveDeleteMaxPerRun: number
   // ── Object storage (Cloudflare R2) ──
   /** R2 connection, or null when strip bytes should stay in Postgres. */
   r2: R2Config | null
@@ -543,7 +559,26 @@ export const env: Env = {
     process.env.BUNDLE_DISCOUNT_PERCENT,
   ),
   bundleEndsAt: optionalDate('BUNDLE_ENDS_AT', process.env.BUNDLE_ENDS_AT),
+  inactiveDeleteEnabled: process.env.INACTIVE_DELETE_ENABLED?.trim() === 'true',
+  inactiveDeleteDays: positiveInt('INACTIVE_DELETE_DAYS', process.env.INACTIVE_DELETE_DAYS, 90),
+  inactiveDeleteSilentDays: positiveInt(
+    'INACTIVE_DELETE_SILENT_DAYS',
+    process.env.INACTIVE_DELETE_SILENT_DAYS,
+    180,
+  ),
+  inactiveDeleteMaxPerRun: positiveInt(
+    'INACTIVE_DELETE_MAX_PER_RUN',
+    process.env.INACTIVE_DELETE_MAX_PER_RUN,
+    200,
+  ),
   r2: parseR2(),
+}
+
+// The first warning goes 14 days before deletion (lib/inactiveAccounts.ts), so a shorter
+// window would warn people who were active the same day. Refuse to boot rather than
+// guess which setting was meant.
+if (env.inactiveDeleteDays <= 14) {
+  throw new Error(`INACTIVE_DELETE_DAYS must be more than 14 (got ${env.inactiveDeleteDays}).`)
 }
 
 // A warning, not a boot refusal — the same posture as SCRAPBOOK_PRICE_IDR: the rest of

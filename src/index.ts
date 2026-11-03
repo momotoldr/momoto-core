@@ -21,6 +21,7 @@ import { sweepScrapbookLimits } from './http/routes/scrapbooks.js'
 import { sweepStatsLimits } from './http/routes/stats.js'
 import { sweepTestimonialsLimits } from './http/routes/testimonials.js'
 import { sweepRemoveLimits, sweepStripLimits, sweepUnlockLimits } from './http/routes/strips.js'
+import { sweepInactiveAccounts } from './lib/inactiveAccounts.js'
 import { logger } from './lib/logger.js'
 import { sweepResolvedSupportTickets } from './lib/supportRetention.js'
 
@@ -64,6 +65,11 @@ const sweeper = setInterval(() => {
   // Resolved support tickets past retention (hourly; see lib/supportRetention.ts).
   void sweepResolvedSupportTickets().catch((err) =>
     logger.error('support.retention.failed', { err: String(err) }),
+  )
+  // Accounts nobody has opened in 90 days: warn, then delete (hourly; see
+  // lib/inactiveAccounts.ts). A dry run unless INACTIVE_DELETE_ENABLED.
+  void sweepInactiveAccounts().catch((err) =>
+    logger.error('inactive.sweep.failed', { err: String(err) }),
   )
 }, 30_000)
 sweeper.unref()
