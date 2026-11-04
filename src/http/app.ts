@@ -5,6 +5,7 @@ import helmet from 'helmet'
 
 import { env } from '../config/env.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
+import { responseEnvelope } from './middleware/responseEnvelope.js'
 import { adminRouter } from './routes/admin.js'
 import { authRouter } from './routes/auth.js'
 import { avatarsRouter } from './routes/avatars.js'
@@ -36,6 +37,10 @@ export function createApp(): Express {
   // per-IP rate limit keys on `clientIp()` instead, which prefers `CLIENT_IP_HEADER`
   // (`cf-connecting-ip`); this setting only matters for that fallback.
   app.set('trust proxy', env.trustProxy)
+
+  // First, so every JSON body below — routes, 404s, `errorHandler` — goes out as
+  // `{ statusCode, result }`.
+  app.use(responseEnvelope)
 
   // Baseline response headers (nosniff, HSTS, referrer policy, frame denial). This is
   // a JSON API that renders nothing, so the CSP and the cross-origin resource policy
