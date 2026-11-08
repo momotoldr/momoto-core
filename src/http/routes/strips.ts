@@ -36,10 +36,14 @@ const STRIP_MAX_BYTES = 8 * 1024 * 1024
 
 /** Uploads store real bytes — keep the rate modest (per user). */
 const stripLimiter = new RateLimiter(30, 10 * 60_000)
+/** Completing reads each file back and decodes it, so it can't be free to repeat. */
+const stripCompleteLimiter = new RateLimiter(60, 10 * 60_000)
+/** Clean copies can stream through this server. Roomy enough to fetch a whole gallery. */
+const downloadLimiter = new RateLimiter(120, 10 * 60_000)
 
 /** Reclaim expired strip-upload rate windows (wired into the periodic sweep). */
 export function sweepStripLimits(now: number = Date.now()): number {
-  return stripLimiter.sweep(now)
+  return stripLimiter.sweep(now) + stripCompleteLimiter.sweep(now) + downloadLimiter.sweep(now)
 }
 
 /**
@@ -909,6 +913,10 @@ stripsRouter.post(
   asyncRoute(async (req, res) => {
     const userId = req.userId as string
     if (!requireStorage(res)) return
+    if (!stripCompleteLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
     const grant = verifyUploadGrant(
       (req.body as { token?: unknown } | undefined)?.token,
       'strip',
@@ -1148,7 +1156,7 @@ stripsRouter.post(
   '/unlock',
   requireAuth,
   asyncRoute(async (req, res) => {
-    if (env.paymentsEnabled) {
+    if (!env.freeUnlockEnabled) {
       res.status(403).json({ error: 'payments_enabled' })
       return
     }
@@ -1435,13 +1443,17 @@ interface CleanCopy {
  * Decide whether the caller may have this strip's clean copy, and answer for them if not.
  *
  * Shared by both ways of handing it over (`/print` streams it, `/print-url` signs a URL
- * for it), so they can never drift apart on who gets the file: owner only, paid when
- * `env.paymentsEnabled`, and a 404 for anything that doesn't resolve. Returns null once
+ * for it), so they can never drift apart on who gets the file: owner only, paid unless
+ * `env.freeUnlockEnabled`, and a 404 for anything that doesn't resolve. Returns null once
  * it has responded.
  */
 async function authorizeCleanCopy(req: Request, res: Response): Promise<CleanCopy | null> {
   const userId = req.userId as string
   const id = req.params.id as string
+  if (!downloadLimiter.allow(userId)) {
+    res.status(429).json({ error: 'too_many_requests' })
+    return null
+  }
   const strip = await prisma.strip.findUnique({
     where: { id },
     // Ownership and the paid gate are decided on metadata alone — the image is
@@ -1456,7 +1468,7 @@ async function authorizeCleanCopy(req: Request, res: Response): Promise<CleanCop
     res.status(404).json({ error: 'not_found' })
     return null
   }
-  if (env.paymentsEnabled && !strip.paid) {
+  if (!strip.paid && !env.freeUnlockEnabled) {
     res.status(402).json({ error: 'payment_required' })
     return null
   }

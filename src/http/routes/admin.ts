@@ -4,6 +4,7 @@ import { type Response, Router } from 'express'
 import { hashPassword } from '../../auth/passwords.js'
 import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
+import { auditAdminRequest } from '../../lib/adminAudit.js'
 import { clientIp, rateLimitKey } from '../../lib/clientIp.js'
 import { isValidEmail } from '../../lib/email.js'
 import {
@@ -35,7 +36,7 @@ import {
 } from '../../payments/midtrans.js'
 import { PARTNER_BOGO } from '../../promos/promos.js'
 import { asyncRoute } from '../asyncRoute.js'
-import { requireAdmin } from '../middleware/requireAdmin.js'
+import { requireAdmin, requireAdminSession } from '../middleware/requireAdmin.js'
 import { requireAuth } from '../middleware/requireAuth.js'
 import {
   serializeAdminFeedback,
@@ -63,14 +64,21 @@ export function sweepAdminLimits(now: number = Date.now()): number {
   return adminLimiter.sweep(now)
 }
 
-// Every admin route: authenticated → is-admin → rate-limited.
-adminRouter.use(requireAuth, requireAdmin, (req, res, next) => {
-  if (!adminLimiter.allow(rateLimitKey(clientIp(req, env.clientIpHeader)))) {
-    res.status(429).json({ error: 'too_many_requests' })
-    return
-  }
-  next()
-})
+// Every admin route: authenticated → is-admin → passed the 6-digit check → audited →
+// rate-limited.
+adminRouter.use(
+  requireAuth,
+  requireAdmin,
+  requireAdminSession,
+  auditAdminRequest,
+  (req, res, next) => {
+    if (!adminLimiter.allow(rateLimitKey(clientIp(req, env.clientIpHeader)))) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
+    next()
+  },
+)
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 

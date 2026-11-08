@@ -14,15 +14,22 @@ export interface AccessClaims {
 
 /** Signs a short-lived access JWT for the given user. */
 export function signAccessToken(userId: string): string {
-  return jwt.sign({}, env.jwtSecret, {
-    subject: userId,
-    expiresIn: env.jwtAccessTtlSeconds,
-  })
+  const options = { subject: userId, expiresIn: env.jwtAccessTtlSeconds }
+  return env.jwtKeyPair
+    ? jwt.sign({}, env.jwtKeyPair.privateKey, { ...options, algorithm: 'ES256' })
+    : jwt.sign({}, env.jwtSecret, { ...options, algorithm: 'HS256' })
 }
 
-/** Verifies an access JWT, returning its claims. Throws if invalid/expired. */
+/**
+ * Verifies an access JWT, returning its claims. Throws if invalid/expired.
+ *
+ * One algorithm only, never both: a token signed the old way after the switch is refused,
+ * and the client recovers through its refresh cookie, which isn't a JWT.
+ */
 export function verifyAccessToken(token: string): AccessClaims {
-  const payload = jwt.verify(token, env.jwtSecret)
+  const payload = env.jwtKeyPair
+    ? jwt.verify(token, env.jwtKeyPair.publicKey, { algorithms: ['ES256'] })
+    : jwt.verify(token, env.jwtSecret, { algorithms: ['HS256'] })
   if (typeof payload === 'string' || typeof payload.sub !== 'string') {
     throw new Error('malformed access token')
   }
@@ -65,41 +72,51 @@ export async function revokeAllForUser(userId: string): Promise<number> {
   return count
 }
 
+export type RotateResult =
+  | { status: 'rotated'; userId: string; raw: string; expiresAt: Date }
+  | { status: 'race' }
+  | { status: 'invalid' }
+
 /**
  * Validates a raw refresh token and rotates it: the presented token is revoked and
  * a fresh one is issued (single-use rotation limits replay of a leaked token).
- * Returns the owning userId + the new token, or null if the token is
- * unknown / expired / already revoked.
+ *
+ * `race` means another request rotated this token a moment ago. The browser's cookie jar
+ * already holds (or is about to hold) that request's new token, so the caller must leave
+ * the cookie alone. `invalid` is unknown / expired / revoked for real.
  *
  * **Reuse detection.** A token that was already rotated should never appear again.
  * Outside the race window above, a replay means someone is holding a copy of a cookie
  * that has since moved on — the signature of a stolen session — so every token for
  * that account is revoked. The legitimate user signs in again; the thief is evicted.
  */
-export async function rotateRefreshToken(
-  raw: string,
-): Promise<{ userId: string; raw: string; expiresAt: Date } | null> {
+export async function rotateRefreshToken(raw: string): Promise<RotateResult> {
   const existing = await prisma.refreshToken.findUnique({ where: { tokenHash: hashToken(raw) } })
-  if (!existing) return null
+  if (!existing) return { status: 'invalid' }
 
   if (existing.revokedAt) {
     if (Date.now() - existing.revokedAt.getTime() > REUSE_GRACE_MS) {
       const revoked = await revokeAllForUser(existing.userId)
       logger.warn('auth.refresh.reuse_detected', { userId: existing.userId, revoked })
-    } else {
-      logger.info('auth.refresh.rotation_race', { userId: existing.userId })
+      return { status: 'invalid' }
     }
-    return null
+    logger.info('auth.refresh.rotation_race', { userId: existing.userId })
+    return { status: 'race' }
   }
 
-  if (existing.expiresAt <= new Date()) return null
+  if (existing.expiresAt <= new Date()) return { status: 'invalid' }
 
-  await prisma.refreshToken.update({
-    where: { id: existing.id },
+  // Conditional, so two requests that both read the token as live can't both rotate it.
+  const { count } = await prisma.refreshToken.updateMany({
+    where: { id: existing.id, revokedAt: null },
     data: { revokedAt: new Date() },
   })
+  if (count === 0) {
+    logger.info('auth.refresh.rotation_race', { userId: existing.userId })
+    return { status: 'race' }
+  }
   const next = await issueRefreshToken(existing.userId)
-  return { userId: existing.userId, ...next }
+  return { status: 'rotated', userId: existing.userId, ...next }
 }
 
 /** Revokes a refresh token (logout). No-op if it doesn't exist. */
