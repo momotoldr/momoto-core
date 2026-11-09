@@ -56,8 +56,22 @@ export const authRouter = Router()
 const REFRESH_COOKIE = 'momoto_rt'
 const REFRESH_COOKIE_PATH = '/auth'
 
-/** Tight cap on credential endpoints (login/register/google) to blunt brute force. */
+/** Signups per address: each mints an account and a piece of mail, so it stays tight. */
 const authLimiter = new RateLimiter(20, 60_000)
+/**
+ * Sign-ins per address. Looser than signup because a mobile carrier can put many real
+ * people behind one address, and `loginFailureLimiter` is what actually stops guessing.
+ */
+const loginIpLimiter = new RateLimiter(60, 60_000)
+/**
+ * "That email is already registered" answers per address. The answer is useful to someone
+ * who mistyped, and a lookup service to anyone asking in bulk, so only the bulk is capped.
+ */
+const emailTakenLimiter = new RateLimiter(10, 60 * 60_000)
+/** Setting a first password has no current one to check, but still costs an argon2 hash. */
+const passwordChangeLimiter = new RateLimiter(10, 15 * 60_000)
+/** Completing an avatar upload reads it back and decodes it. */
+const avatarCompleteLimiter = new RateLimiter(40, 10 * 60_000)
 /** Refresh is hit routinely by every active tab; allow more headroom. */
 const refreshLimiter = new RateLimiter(60, 60_000)
 /**
@@ -112,6 +126,13 @@ async function verifyCurrentPassword(
  */
 const emailClaimLimiter = new RateLimiter(5, 60 * 60_000)
 const resendLimiter = new RateLimiter(3, 60 * 60_000)
+/**
+ * Verification mail per *address*, across every account and source. Both limits above and
+ * the per-IP cap on signup leave a gap: each new account gets a fresh budget, so a script
+ * could register over and over to flood one stranger's inbox and spend our sender
+ * reputation doing it.
+ */
+const addressMailLimiter = new RateLimiter(5, 60 * 60_000)
 /** Reset requests per source IP. */
 const forgotIpLimiter = new RateLimiter(5, 15 * 60_000)
 /**
@@ -127,12 +148,17 @@ const resetTokenLimiter = new RateLimiter(20, 15 * 60_000)
 export function sweepAuthLimits(now: number = Date.now()): number {
   return (
     authLimiter.sweep(now) +
+    loginIpLimiter.sweep(now) +
+    emailTakenLimiter.sweep(now) +
+    passwordChangeLimiter.sweep(now) +
+    avatarCompleteLimiter.sweep(now) +
     refreshLimiter.sweep(now) +
     loginFailureLimiter.sweep(now) +
     reauthFailureLimiter.sweep(now) +
     avatarLimiter.sweep(now) +
     emailClaimLimiter.sweep(now) +
     resendLimiter.sweep(now) +
+    addressMailLimiter.sweep(now) +
     forgotIpLimiter.sweep(now) +
     forgotAccountLimiter.sweep(now) +
     resetTokenLimiter.sweep(now)
@@ -140,6 +166,8 @@ export function sweepAuthLimits(now: number = Date.now()): number {
 }
 
 const MIN_PASSWORD = 8
+/** Past any username or email address we hold. Bounds what becomes a limiter key. */
+const MAX_LOGIN_IDENTIFIER = 254
 const MAX_DISPLAY_NAME = 60
 /** Usernames are alphanumeric only (no special characters), 3–20 chars. */
 const USERNAME_RE = /^[a-z0-9]{3,20}$/
@@ -269,8 +297,13 @@ authRouter.post(
     // Advisory: refuse early when a *proven* account already holds this address, so
     // the user fixes it here instead of getting a verification link that can never
     // succeed. Not the real guard — the unique index at verification time is.
+    const probeKey = rateLimitKey(ip)
+    if (!emailTakenLimiter.peek(probeKey)) {
+      return void limited(res, 'auth.register.email_probe_limited', ip)
+    }
     const emailHolder = await prisma.user.findUnique({ where: { email } })
     if (emailHolder?.emailVerifiedAt) {
+      emailTakenLimiter.allow(probeKey)
       res.status(409).json({ error: 'email_taken' })
       return
     }
@@ -281,6 +314,12 @@ authRouter.post(
     if (existing) {
       res.status(409).json({ error: 'username_taken' })
       return
+    }
+
+    // Past the two checks a person retrying the form would trip, so only attempts that
+    // would really send mail spend this budget.
+    if (!addressMailLimiter.allow(email)) {
+      return void limited(res, 'auth.register.address_limited', ip)
     }
 
     // The check above is advisory only: hashing takes ~100ms, and two concurrent
@@ -325,12 +364,21 @@ authRouter.post(
   '/login',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
-    if (!authLimiter.allow(rateLimitKey(ip))) return void limited(res, 'auth.login.ratelimited', ip)
+    if (!loginIpLimiter.allow(rateLimitKey(ip))) {
+      return void limited(res, 'auth.login.ratelimited', ip)
+    }
 
     const username = String(req.body?.username ?? '')
       .trim()
       .toLowerCase()
     const password = String(req.body?.password ?? '')
+
+    // No account has a name this long, and the name becomes a limiter key below, where a
+    // 64 KB string would sit in memory for the whole window.
+    if (username.length > MAX_LOGIN_IDENTIFIER) {
+      res.status(401).json({ error: 'invalid_credentials' })
+      return
+    }
 
     // Per-account failure budget. The hit is spent here, before argon2, so parallel
     // guesses can't all slip past the check; a success below refunds it by clearing
@@ -369,7 +417,7 @@ authRouter.post(
   '/google',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
-    if (!authLimiter.allow(rateLimitKey(ip)))
+    if (!loginIpLimiter.allow(rateLimitKey(ip)))
       return void limited(res, 'auth.google.ratelimited', ip)
 
     // From the FE's redirect sign-in (its /auth/google/callback page): the code, the
@@ -477,7 +525,14 @@ authRouter.post(
     }
 
     const rotated = await rotateRefreshToken(raw)
-    if (!rotated) {
+    // Another tab refreshed with this cookie a moment ago and has the new one. Clearing it
+    // here would delete that tab's fresh session, so answer without touching the cookie
+    // and let the client try again.
+    if (rotated.status === 'race') {
+      res.status(409).json({ error: 'refresh_race' })
+      return
+    }
+    if (rotated.status === 'invalid') {
       res.clearCookie(REFRESH_COOKIE, refreshCookieOptions())
       res.status(401).json({ error: 'unauthorized' })
       return
@@ -548,6 +603,11 @@ authRouter.post(
     const email = normalizeEmail(req.body?.email)
     if (!isValidEmail(email)) {
       res.status(400).json({ error: 'invalid_input' })
+      return
+    }
+
+    if (!addressMailLimiter.allow(email)) {
+      res.status(429).json({ error: 'too_many_requests' })
       return
     }
 
@@ -649,6 +709,10 @@ authRouter.post(
       res.status(400).json({ error: 'invalid_input' })
       return
     }
+    if (!passwordChangeLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
 
     // An account with a password must re-supply it — same reasoning as
     // `DELETE /auth/me`: an access token left behind on a shared device shouldn't be
@@ -721,7 +785,11 @@ authRouter.post(
 
     // Accepted and answered identically even when malformed — a 400 here would say
     // "that isn't one of ours", which is the same leak by another route.
-    if (identifier && forgotAccountLimiter.allow(identifier)) {
+    if (
+      identifier &&
+      identifier.length <= MAX_LOGIN_IDENTIFIER &&
+      forgotAccountLimiter.allow(identifier)
+    ) {
       // Sign-in is username-first, but people remember their email. Take either.
       const user = identifier.includes('@')
         ? await prisma.user.findUnique({ where: { email: identifier } })
@@ -739,18 +807,21 @@ authRouter.post(
   }),
 )
 
-// ── GET /auth/reset-password ─── is this link still good? ────────────────────
+// ── POST /auth/reset-password/check ─── is this link still good? ─────────────
 //
 // Returns a bare boolean: never the address, never the username. Someone holding a
 // spent token should not be able to learn whose account it was.
-authRouter.get(
-  '/reset-password',
+//
+// A POST with the token in the body because a query string ends up in access logs, and
+// this token can take over an account.
+authRouter.post(
+  '/reset-password/check',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
     if (!resetTokenLimiter.allow(rateLimitKey(ip)))
       return void limited(res, 'auth.reset.ratelimited', ip)
 
-    const token = typeof req.query.token === 'string' ? req.query.token : ''
+    const token = typeof req.body?.token === 'string' ? req.body.token : ''
     res.json({ valid: token ? await isResetTokenValid(token) : false })
   }),
 )
@@ -1058,6 +1129,10 @@ authRouter.post(
     const userId = req.userId as string
     if (!storageEnabled) {
       res.status(409).json({ error: 'direct_upload_unavailable' })
+      return
+    }
+    if (!avatarCompleteLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
       return
     }
     const grant = verifyUploadGrant(

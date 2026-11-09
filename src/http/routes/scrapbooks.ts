@@ -101,10 +101,20 @@ const saveLimiter = new RateLimiter(600, 10 * 60_000)
 const finishLimiter = new RateLimiter(20, 10 * 60_000)
 /** Everything else that changes a row: create, reopen, unlock, remove, delete. */
 const changeLimiter = new RateLimiter(60, 10 * 60_000)
+/** Completing a finish reads the files back, so it can't be free to repeat. */
+const finishCompleteLimiter = new RateLimiter(40, 10 * 60_000)
+/** The PDF can stream through this server. */
+const pdfLimiter = new RateLimiter(60, 10 * 60_000)
 
 /** Reclaim expired scrapbook rate windows (wired into the periodic sweep). */
 export function sweepScrapbookLimits(now: number = Date.now()): number {
-  return saveLimiter.sweep(now) + finishLimiter.sweep(now) + changeLimiter.sweep(now)
+  return (
+    saveLimiter.sweep(now) +
+    finishLimiter.sweep(now) +
+    changeLimiter.sweep(now) +
+    finishCompleteLimiter.sweep(now) +
+    pdfLimiter.sweep(now)
+  )
 }
 
 // ── Shape ────────────────────────────────────────────────────────────────────
@@ -731,6 +741,10 @@ scrapbooksRouter.post(
     const userId = req.userId as string
     const scrapbookId = req.params.id as string
     if (!requireScrapbookStorage(res)) return
+    if (!finishCompleteLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
     const grant = verifyUploadGrant(
       (req.body as { token?: unknown } | undefined)?.token,
       'scrapbook',
@@ -946,7 +960,7 @@ scrapbooksRouter.post(
   '/:id/unlock',
   requireAuth,
   asyncRoute(async (req, res) => {
-    if (env.paymentsEnabled) {
+    if (!env.freeUnlockEnabled) {
       res.status(403).json({ error: 'payments_enabled' })
       return
     }
@@ -1067,7 +1081,7 @@ scrapbooksRouter.delete(
  * they can never drift apart on who gets the file — the `authorizeCleanCopy` pattern.
  *
  * Stricter than a strip's clean copy on one point: the PDF needs `paid` **whatever**
- * `env.paymentsEnabled` says. A scrapbook has its own free unlock while payments are dark,
+ * `env.freeUnlockEnabled` says. A scrapbook has its own free unlock while payments are dark,
  * so there is no state in which an unpaid PDF should leave the server.
  */
 async function authorizePdf(
@@ -1075,6 +1089,10 @@ async function authorizePdf(
   res: Response,
 ): Promise<{ key: string; filename: string } | null> {
   const userId = req.userId as string
+  if (!pdfLimiter.allow(userId)) {
+    res.status(429).json({ error: 'too_many_requests' })
+    return null
+  }
   const row = await findOwn(userId, req.params.id as string)
   if (!row || !row.pdfKey) {
     notFound(res)

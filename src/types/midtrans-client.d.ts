@@ -53,6 +53,8 @@ declare module 'midtrans-client' {
 
   export class CoreApi {
     constructor(config: Config)
+    /** The library's axios wrapper; we only reach in to set a timeout on it. */
+    httpClient: { http_client: { defaults: { timeout?: number } } }
     /**
      * Resolves to the raw charge response. Deliberately `unknown`: the useful parts
      * (`actions`, `expiry_time`) vary by channel, so the caller narrows them rather

@@ -94,6 +94,13 @@ model User {
   /// UI language at the last sign-in, so a mail sent with no request behind it (the
   /// inactivity warning) still matches. Null = English.
   lang             String?
+  /// Admin 6-digit codes: the shared secret, encrypted (`auth/totp.ts`). Set while setup is
+  /// in progress; only `totpEnabledAt` means it's confirmed.
+  totpSecret       String?
+  /// When TOTP was confirmed. Also versions admin sessions: changing it ends them.
+  totpEnabledAt    DateTime?
+  /// The newest 30-second step a code was accepted for, so a seen code can't be replayed.
+  totpLastStep     Int?
 
   // Partner linking — a mutual one-to-one couple link (see partner routes). When
   // linked, both users' partnerId point at each other; unlinking clears both.
@@ -112,6 +119,7 @@ model User {
   refundedPayments   Payment[]                @relation("PaymentRefundedBy")
   promoGrants        PromoGrant[]             @relation("PromoGrantOwner")
   promoGrantsSourced PromoGrant[]             @relation("PromoGrantSource")
+  totpRecoveryCodes  TotpRecoveryCode[]
   feedbacks          Feedback[]               @relation("FeedbackAuthor")
   supportTickets     SupportTicket[]          @relation("SupportTicketAuthor")
   supportReplies     SupportReply[]           @relation("SupportReplySentBy")
@@ -741,4 +749,38 @@ model DailyStat {
 model MetricTotal {
   metric String @id
   value  BigInt
+}
+
+/// One request against the operator surface: every `/admin/*` call by an admin, reads of
+/// personal data included, and every signed-in non-admin turned away from it. Written by
+/// `lib/adminAudit.ts`, kept a year, and never changed afterwards.
+///
+/// `actorId` is deliberately not a relation, so the record outlives the account. The query
+/// string is deliberately left out, because a search term is usually someone's name.
+model AdminAuditLog {
+  id        String   @id @default(cuid())
+  actorId   String
+  method    String
+  /// Includes the target's id, as in `/admin/users/<id>`.
+  path      String
+  status    Int
+  ipPrefix  String?
+  createdAt DateTime @default(now())
+
+  /// One operator's history, newest first.
+  @@index([actorId, createdAt])
+  /// The retention sweep, and reading the whole log by time.
+  @@index([createdAt])
+}
+
+/// A one-time code for an admin who has lost their phone. Hashed, because it is only ever
+/// compared, and shown to its owner once.
+model TotpRecoveryCode {
+  id       String    @id @default(cuid())
+  userId   String
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash String
+  usedAt   DateTime?
+
+  @@unique([userId, codeHash])
 }

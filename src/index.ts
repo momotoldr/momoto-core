@@ -12,15 +12,18 @@ import { env } from './config/env.js'
 import { prisma } from './db/client.js'
 import { createApp } from './http/app.js'
 import { sweepAdminLimits } from './http/routes/admin.js'
+import { sweepAdminMfaLimits } from './http/routes/adminMfa.js'
 import { sweepAuthLimits } from './http/routes/auth.js'
 import { sweepFeedbackLimits } from './http/routes/feedback.js'
 import { sweepLocationsLimits } from './http/routes/locations.js'
 import { sweepPartnerInvites, sweepPartnerLimits } from './http/routes/partner.js'
-import { sweepPaymentLimits } from './http/routes/payments.js'
+import { reconcilePendingPayments, sweepPaymentLimits } from './http/routes/payments.js'
 import { sweepScrapbookLimits } from './http/routes/scrapbooks.js'
 import { sweepStatsLimits } from './http/routes/stats.js'
 import { sweepTestimonialsLimits } from './http/routes/testimonials.js'
 import { sweepRemoveLimits, sweepStripLimits, sweepUnlockLimits } from './http/routes/strips.js'
+import { sweepGlobalRateLimit } from './http/middleware/globalRateLimit.js'
+import { sweepAdminAudit } from './lib/adminAudit.js'
 import { sweepInactiveAccounts } from './lib/inactiveAccounts.js'
 import { logger } from './lib/logger.js'
 import { sweepResolvedSupportTickets } from './lib/supportRetention.js'
@@ -47,6 +50,8 @@ const sweeper = setInterval(() => {
     sweepAuthLimits()
     sweepPartnerLimits()
     sweepAdminLimits()
+    sweepGlobalRateLimit()
+    sweepAdminMfaLimits()
   } catch (err) {
     logger.error('sweep.failed', { err: String(err) })
   }
@@ -71,6 +76,13 @@ const sweeper = setInterval(() => {
   void sweepInactiveAccounts().catch((err) =>
     logger.error('inactive.sweep.failed', { err: String(err) }),
   )
+  // Orders past expiry whose notification never came: ask Midtrans (every 5 minutes).
+  void reconcilePendingPayments().catch((err) =>
+    logger.error('payments.reconcile.sweep.failed', { err: String(err) }),
+  )
+  void sweepAdminAudit().catch((err) =>
+    logger.error('admin.audit.sweep.failed', { err: String(err) }),
+  )
 }, 30_000)
 sweeper.unref()
 
@@ -82,6 +94,7 @@ httpServer.listen(env.port, () => {
     // silent no-op that still reports success to the caller, which is the one failure
     // here that otherwise looks exactly like everything working.
     notify: env.notify ? env.notify.url : 'NOT CONFIGURED — mail is logged, not sent',
+    accessTokens: env.jwtKeyPair ? 'ES256' : 'HS256',
     // The base every emailed link is built from. Wrong value = links that 404 or
     // point at the admin console; it falls back to the first CORS origin.
     appBaseUrl: env.appBaseUrl,

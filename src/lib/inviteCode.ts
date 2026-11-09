@@ -5,7 +5,8 @@ import { randomInt } from 'node:crypto'
 // to a user, but deliberately a separate copy: they are different codes that only
 // happened to start out identical, and neither should change because the other did.
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
-const DEFAULT_LENGTH = 6
+// Longer than a room code: a room lives minutes, while a partner link is permanent.
+const DEFAULT_LENGTH = 8
 
 /** Crypto-strong, human-friendly partner invite code. */
 export function generateInviteCode(length: number = DEFAULT_LENGTH): string {

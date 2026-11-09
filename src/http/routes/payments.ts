@@ -5,6 +5,8 @@ import { Router } from 'express'
 
 import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
+import { clientIp, rateLimitKey } from '../../lib/clientIp.js'
+import { ipPrefix } from '../../lib/ipPrefix.js'
 import { logger } from '../../lib/logger.js'
 import { sendPaymentReceipt } from '../../notifications/client.js'
 import { normalizeLang } from '../../notifications/lang.js'
@@ -43,10 +45,20 @@ const checkoutLimiter = new RateLimiter(20, 10 * 60_000)
 const quoteLimiter = new RateLimiter(240, 10 * 60_000)
 /** "I've paid" checks and cancels each ask Midtrans, so a tight bound. */
 const statusCheckLimiter = new RateLimiter(10, 10 * 60_000)
+/** Saving the QR makes this server fetch it from Midtrans each time. */
+const qrLimiter = new RateLimiter(30, 10 * 60_000)
+/** The webhook is public: anyone can fail its signature, as fast as they like. */
+const badSignatureLogLimiter = new RateLimiter(5, 60_000)
 
 /** Reclaim expired checkout rate windows (wired into the periodic sweep). */
 export function sweepPaymentLimits(now: number = Date.now()): number {
-  return checkoutLimiter.sweep(now) + quoteLimiter.sweep(now) + statusCheckLimiter.sweep(now)
+  return (
+    checkoutLimiter.sweep(now) +
+    quoteLimiter.sweep(now) +
+    statusCheckLimiter.sweep(now) +
+    qrLimiter.sweep(now) +
+    badSignatureLogLimiter.sweep(now)
+  )
 }
 
 /**
@@ -127,8 +139,12 @@ const PAYMENT_SELECT = {
  * and that POST landing, the row still says `pending` — resuming it would show a QR
  * that can no longer be paid.
  */
-function findLivePayment(userId: string, now: Date = new Date()) {
-  return prisma.payment.findFirst({
+function findLivePayment(
+  userId: string,
+  now: Date = new Date(),
+  db: Prisma.TransactionClient = prisma,
+) {
+  return db.payment.findFirst({
     where: { userId, status: 'pending', expiresAt: { gt: now } },
     orderBy: { createdAt: 'desc' },
     select: PAYMENT_SELECT,
@@ -265,25 +281,51 @@ paymentsRouter.post(
     const grossAmount = chargeTotal(items)
     const orderId = `pay_${randomUUID()}`
 
-    const charge = await chargeTransaction({
-      orderId,
-      items,
-      returnPath: '/cart',
-      customer: { name: user?.displayName ?? 'Momoto user', email: user?.email ?? null },
-      method,
-    })
+    let charge
+    try {
+      charge = await chargeTransaction({
+        orderId,
+        items,
+        returnPath: '/cart',
+        customer: { name: user?.displayName ?? 'Momoto user', email: user?.email ?? null },
+        method,
+      })
+    } catch (error) {
+      const status = midtransErrorStatus(error)
+      logger.warn('payments.charge.midtransFailed', { userId, orderId, status, err: String(error) })
+      // No answer at all (a timeout, a dropped connection) means the transaction may exist
+      // at Midtrans. Its QR was never shown to anyone, so this is only tidying up.
+      if (status === null) void cancelTransaction(orderId).catch(() => undefined)
+      res.status(502).json({ error: 'midtrans_unavailable' })
+      return
+    }
 
+    const refuse = (refusal: ChargeRefusal) => ({ ok: false as const, refusal })
     const recorded = await prisma.$transaction(async (tx) => {
+      // One buyer's checkouts go through here one at a time. The live-payment check above
+      // ran before the seconds-long Midtrans call, so a second request (another tab, or a
+      // retry after the client timed out) could pass it too. Without this each would
+      // record a payable order for the same strips, and each could be priced with the
+      // same partner reward. Taken before the scrapbook locks, always in this order.
+      await tx.$queryRaw`SELECT 1 FROM "User" WHERE "id" = ${userId} FOR NO KEY UPDATE`
+      const concurrent = await findLivePayment(userId, new Date(), tx)
+      if (concurrent) {
+        return refuse({
+          status: 409,
+          error: 'payment_in_progress',
+          payment: serializePayment(concurrent),
+        })
+      }
       for (const id of scrapbookIds) await lockScrapbook(tx, id)
       const refusal = await refuseScrapbooks(userId, scrapbookIds, tx)
-      if (refusal) return { ok: false as const, refusal }
+      if (refusal) return refuse(refusal)
       // The promos too: the Midtrans call took seconds, and the price it was opened at
       // must still be the price. Anything that moved it (a reward spent by a late
       // settlement, a promo switched off) abandons this attempt like any other refusal;
       // the cart re-quotes on the retry.
       const requote = await quoteOrder(userId, stripIds.length, scrapbookIds.length, method, tx)
       if (!sameQuote(quote, requote)) {
-        return { ok: false as const, refusal: { status: 409, error: 'price_changed' } }
+        return refuse({ status: 409, error: 'price_changed' })
       }
       const payment = await tx.payment.create({
         data: {
@@ -315,8 +357,10 @@ paymentsRouter.post(
         // Unrecorded and never shown, so it can't be paid; it expires on its own.
         logger.warn('payments.charge.cancelFailed', { orderId, err: String(error) })
       }
-      logger.info('payments.charge.abandoned', { userId, orderId, error: recorded.refusal.error })
-      res.status(recorded.refusal.status).json({ error: recorded.refusal.error })
+      const { status, error, payment } = recorded.refusal
+      logger.info('payments.charge.abandoned', { userId, orderId, error })
+      // `payment` is the attempt that won, in the shape the client resumes from.
+      res.status(status).json({ error, ...(payment ? { payment } : {}) })
       return
     }
     logger.info('payments.charge.created', {
@@ -333,6 +377,13 @@ paymentsRouter.post(
     res.status(201).json(serializePayment(recorded.payment))
   }),
 )
+
+/** Why `/charge` abandoned an attempt, with the winning attempt when another one won. */
+interface ChargeRefusal {
+  status: number
+  error: string
+  payment?: ReturnType<typeof serializePayment>
+}
 
 /** A list of ids from the body, de-duplicated; absent is empty, anything else is null. */
 function readIds(value: unknown): string[] | null {
@@ -485,6 +536,7 @@ async function applyMidtransStatus(
   orderId: string,
   transactionStatus: string,
   fraudStatus?: string,
+  reportedAmount?: unknown,
 ): Promise<void> {
   const payment = await prisma.payment.findUnique({
     where: { orderId },
@@ -508,7 +560,26 @@ async function applyMidtransStatus(
   }
 
   const next = mapStatus(transactionStatus, fraudStatus)
-  if (next === null) {
+  // Every row starts `pending`, so this notification has nothing to add, and it can only
+  // do harm when it arrives late: Midtrans retries it, so one delayed past a cancel would
+  // put the order back to pending and block the buyer's next checkout until the dead QR's
+  // expiry.
+  if (next === null || next === 'pending') {
+    return
+  }
+
+  // Midtrans signs what it reports, so this should never fire. If it does, the money that
+  // moved isn't what we asked for: leave the order unsettled for a person to look at.
+  if (
+    next === 'paid' &&
+    reportedAmount !== undefined &&
+    Number(reportedAmount) !== payment.grossAmount
+  ) {
+    logger.error('payments.amount_mismatch', {
+      orderId,
+      expected: payment.grossAmount,
+      reported: String(reportedAmount).slice(0, 32),
+    })
     return
   }
 
@@ -635,12 +706,19 @@ paymentsRouter.post(
         signature_key: signatureKey,
       })
     ) {
-      logger.warn('payments.notification.bad_signature', { orderId })
+      // `orderId` is whatever the caller sent, so its length and the rate are both capped.
+      const ip = clientIp(req, env.clientIpHeader)
+      if (badSignatureLogLimiter.allow(rateLimitKey(ip))) {
+        logger.warn('payments.notification.bad_signature', {
+          orderId: orderId.slice(0, 64),
+          ipPrefix: ipPrefix(ip),
+        })
+      }
       res.status(403).json({ error: 'invalid_signature' })
       return
     }
 
-    await applyMidtransStatus(orderId, transactionStatus, fraudStatus)
+    await applyMidtransStatus(orderId, transactionStatus, fraudStatus, grossAmount)
     res.status(200).json({ ok: true })
   }),
 )
@@ -655,12 +733,80 @@ async function syncFromMidtrans(orderId: string): Promise<boolean> {
     const t = (await fetchTransactionStatus(orderId)) as Record<string, unknown>
     const transactionStatus = typeof t.transaction_status === 'string' ? t.transaction_status : ''
     const fraudStatus = typeof t.fraud_status === 'string' ? t.fraud_status : undefined
-    await applyMidtransStatus(orderId, transactionStatus, fraudStatus)
+    await applyMidtransStatus(orderId, transactionStatus, fraudStatus, t.gross_amount)
     return true
   } catch (error) {
     if (midtransErrorStatus(error) === 404) return false
     throw error
   }
+}
+
+/** The sweeper ticks every 30 s; asking Midtrans only needs to happen this often. */
+const RECONCILE_EVERY_MS = 5 * 60_000
+/** How long past expiry to leave the `expire` or `settlement` notification to arrive. */
+const RECONCILE_GRACE_MS = 2 * 60_000
+/** For the rare order Midtrans gave no expiry: how old it must be before we ask. */
+const RECONCILE_NO_EXPIRY_AFTER_MS = 60 * 60_000
+/** Stop asking after this. Keeps a row Midtrans never resolves from being asked forever. */
+const RECONCILE_WINDOW_MS = 3 * 24 * 60 * 60_000
+const RECONCILE_BATCH = 50
+let lastReconcile = 0
+
+/**
+ * Settle orders whose notification never arrived. Wired into the periodic sweep.
+ *
+ * Only a notification or the buyer pressing "I've paid" moves an order, and once its QR
+ * expires the cart stops offering it. So a lost notification on a paid order would leave
+ * the buyer charged with nothing unlocked. This asks Midtrans about every order still
+ * `pending` past its expiry and applies the answer exactly as the webhook would.
+ *
+ * Safe on every instance: `applyMidtransStatus` is idempotent and unlocks once.
+ */
+export async function reconcilePendingPayments(now: Date = new Date()): Promise<number> {
+  if (!env.paymentsEnabled || now.getTime() - lastReconcile < RECONCILE_EVERY_MS) return 0
+  lastReconcile = now.getTime()
+
+  const stale = await prisma.payment.findMany({
+    where: {
+      status: 'pending',
+      createdAt: { gte: new Date(now.getTime() - RECONCILE_WINDOW_MS) },
+      OR: [
+        { expiresAt: { lt: new Date(now.getTime() - RECONCILE_GRACE_MS) } },
+        {
+          expiresAt: null,
+          createdAt: { lt: new Date(now.getTime() - RECONCILE_NO_EXPIRY_AFTER_MS) },
+        },
+      ],
+    },
+    orderBy: { createdAt: 'asc' },
+    take: RECONCILE_BATCH,
+    select: { orderId: true },
+  })
+  if (stale.length === 0) return 0
+
+  for (const { orderId } of stale) {
+    try {
+      // Unknown to Midtrans and past expiry: nothing can ever be paid against it.
+      if (!(await syncFromMidtrans(orderId))) await applyMidtransStatus(orderId, 'expire')
+    } catch (error) {
+      logger.warn('payments.reconcile.failed', { orderId, err: String(error) })
+    }
+  }
+
+  const orderIds = stale.map((row) => row.orderId)
+  const settled = await prisma.payment.findMany({
+    where: { orderId: { in: orderIds }, status: 'paid' },
+    select: { orderId: true },
+  })
+  logger.info('payments.reconcile', { checked: orderIds.length, paid: settled.length })
+  // Money arrived without its notification. Worth an alert: more than a stray one means
+  // the Notification URL or the path to it is broken.
+  if (settled.length > 0) {
+    logger.warn('payments.reconcile.lost_notification', {
+      orderIds: settled.map((row) => row.orderId),
+    })
+  }
+  return orderIds.length
 }
 
 // ── POST /payments/:orderId/check ─── "I've paid": ask Midtrans ourselves ─────
@@ -878,6 +1024,10 @@ paymentsRouter.get(
   requireAuth,
   asyncRoute(async (req, res) => {
     const userId = req.userId as string
+    if (!qrLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
     const payment = await prisma.payment.findUnique({
       where: { orderId: req.params.orderId },
       select: { userId: true, qrImageUrl: true },
