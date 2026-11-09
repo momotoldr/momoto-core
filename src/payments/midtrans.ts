@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, timingSafeEqual } from 'node:crypto'
 
 // midtrans-client is CommonJS and its named exports aren't visible to Node's ESM
 // lexer, so import the default and destructure the classes at runtime; the type
@@ -22,13 +22,23 @@ const { CoreApi } = midtransClient
  */
 let core: CoreApiType | null = null
 
+/**
+ * How long one Midtrans call may take. The library sets no timeout, so a hung connection
+ * would hold a request open indefinitely. Kept under the frontend's 10 s request timeout,
+ * so the buyer gets our answer rather than giving up and retrying into a second charge.
+ */
+const MIDTRANS_TIMEOUT_MS = 8_000
+
 function getCore(): CoreApiType {
-  core ??= new CoreApi({
-    // Non-null: callers gate on `env.paymentsEnabled` before reaching here.
-    isProduction: env.midtransIsProduction,
-    serverKey: env.midtransServerKey as string,
-    clientKey: env.midtransClientKey as string,
-  })
+  if (!core) {
+    core = new CoreApi({
+      // Non-null: callers gate on `env.paymentsEnabled` before reaching here.
+      isProduction: env.midtransIsProduction,
+      serverKey: env.midtransServerKey as string,
+      clientKey: env.midtransClientKey as string,
+    })
+    core.httpClient.http_client.defaults.timeout = MIDTRANS_TIMEOUT_MS
+  }
   return core
 }
 
@@ -167,15 +177,16 @@ export function verifyNotificationSignature(payload: {
   gross_amount: string
   signature_key: string
 }): boolean {
-  const expected = createHash('sha512')
-    .update(
-      payload.order_id +
-        payload.status_code +
-        payload.gross_amount +
-        (env.midtransServerKey as string),
-    )
-    .digest('hex')
-  return expected === payload.signature_key
+  // The route is reachable with payments off. Without a key the hash below would be over
+  // the text "null", which anyone can compute.
+  if (!env.midtransServerKey) return false
+  const expected = Buffer.from(
+    createHash('sha512')
+      .update(payload.order_id + payload.status_code + payload.gross_amount + env.midtransServerKey)
+      .digest('hex'),
+  )
+  const presented = Buffer.from(payload.signature_key)
+  return presented.length === expected.length && timingSafeEqual(presented, expected)
 }
 
 /**

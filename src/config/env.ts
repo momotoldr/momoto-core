@@ -2,6 +2,8 @@
 // other import here, and `src/index.ts` imports it first of all for the same reason.
 import './loadEnv.js'
 
+import { createPrivateKey, createPublicKey, type KeyObject } from 'node:crypto'
+
 import { logger } from '../lib/logger.js'
 import type { PaymentMethod } from '../payments/midtrans.js'
 import type { AdminFeeRule } from '../promos/pricing.js'
@@ -19,8 +21,18 @@ export interface Env {
   clientIpHeader: string | null
   // Rooms, session timing and TURN live in momoto-realtime's config, not here.
   // ── Auth ──
-  /** Signs access tokens. momoto-realtime verifies them, so its value must be identical. */
+  /**
+   * Derives the upload-grant key, and signs access tokens until `jwtKeyPair` is set.
+   * Never needs to be shared once it is.
+   */
   jwtSecret: string
+  /**
+   * Signs access tokens (ES256) when set, so that only this service can mint a login.
+   * The other services hold just the public half, and core stops accepting HS256.
+   */
+  jwtKeyPair: { privateKey: KeyObject; publicKey: KeyObject } | null
+  /** How long an admin stays in after a 6-digit code. */
+  adminSessionTtlSeconds: number
   jwtAccessTtlSeconds: number
   jwtRefreshTtlSeconds: number
   googleClientId: string | null
@@ -91,6 +103,14 @@ export interface Env {
   adminFees: Record<PaymentMethod, AdminFeeRule | null>
   /** True when PAYMENTS_ENABLED=true and both Midtrans keys are set. */
   paymentsEnabled: boolean
+  /**
+   * Whether items may be unlocked without paying: the stand-in for checkout while payments
+   * are dark. Its own switch on purpose. It used to be "payments are off", so losing the
+   * flag or either Midtrans key handed every clean copy out for free.
+   */
+  freeUnlockEnabled: boolean
+  /** Per-address backstop across the whole API, per minute. See `globalRateLimit`. */
+  apiRateLimitPerMinute: number
   /**
    * How many *unpaid* strips one user may keep at a time. Paid strips are exempt —
    * the cap limits free storage, and nothing someone bought is ever refused or
@@ -347,6 +367,30 @@ function requiredSecret(name: string, raw: string | undefined): string {
 }
 
 /**
+ * The P-256 signing key from `JWT_PRIVATE_KEY`, or null while the service still signs with
+ * HS256. A PEM (real or `\n`-escaped newlines) or the same PEM in base64, which is the
+ * easiest form to paste into a platform's variables. A key we can't use stops the boot,
+ * and the message never repeats the value.
+ */
+function parseJwtKeyPair(raw: string | undefined): Env['jwtKeyPair'] {
+  const value = raw?.trim()
+  if (!value) return null
+  const pem = value.includes('-----BEGIN')
+    ? value.replace(/\\n/g, '\n')
+    : Buffer.from(value, 'base64').toString('utf8')
+  let privateKey: KeyObject
+  try {
+    privateKey = createPrivateKey(pem)
+  } catch {
+    throw new Error('Invalid JWT_PRIVATE_KEY: not a readable private key.')
+  }
+  if (privateKey.asymmetricKeyDetails?.namedCurve !== 'prime256v1') {
+    throw new Error('Invalid JWT_PRIVATE_KEY: expected an EC key on the P-256 curve.')
+  }
+  return { privateKey, publicKey: createPublicKey(privateKey) }
+}
+
+/**
  * Read the R2 configuration, or null when it isn't set up (bytes stay in Postgres).
  *
  * Presence is decided by the account id alone, so a half-filled config fails loudly
@@ -507,11 +551,17 @@ export const env: Env = {
   trustProxy: nonNegativeInt('TRUST_PROXY', process.env.TRUST_PROXY, 1),
   clientIpHeader: process.env.CLIENT_IP_HEADER?.trim().toLowerCase() || null,
   jwtSecret: requiredSecret('JWT_SECRET', process.env.JWT_SECRET),
+  jwtKeyPair: parseJwtKeyPair(process.env.JWT_PRIVATE_KEY),
+  adminSessionTtlSeconds: positiveInt('ADMIN_SESSION_TTL', process.env.ADMIN_SESSION_TTL, 28_800),
   jwtAccessTtlSeconds: positiveInt('JWT_ACCESS_TTL', process.env.JWT_ACCESS_TTL, 3600),
   jwtRefreshTtlSeconds: positiveInt('JWT_REFRESH_TTL', process.env.JWT_REFRESH_TTL, 604_800),
   googleClientId: process.env.GOOGLE_CLIENT_ID?.trim() || null,
   googleClientSecret: process.env.GOOGLE_CLIENT_SECRET?.trim() || null,
-  cookieSecure: process.env.COOKIE_SECURE?.trim() === 'true',
+  // On in production unless explicitly turned off, so a missing variable can't send the
+  // refresh token over plain HTTP.
+  cookieSecure: process.env.COOKIE_SECURE
+    ? process.env.COOKIE_SECURE.trim() === 'true'
+    : process.env.NODE_ENV === 'production',
   inviteOnly: process.env.INVITE_ONLY?.trim() === 'true',
   notify: parseNotify(),
   appBaseUrl: parseAppBaseUrl(corsOrigins),
@@ -541,6 +591,12 @@ export const env: Env = {
   paymentsEnabled:
     process.env.PAYMENTS_ENABLED?.trim() === 'true' &&
     Boolean(process.env.MIDTRANS_SERVER_KEY?.trim() && process.env.MIDTRANS_CLIENT_KEY?.trim()),
+  freeUnlockEnabled: process.env.FREE_UNLOCK_ENABLED?.trim() === 'true',
+  apiRateLimitPerMinute: positiveInt(
+    'API_RATE_LIMIT_PER_MINUTE',
+    process.env.API_RATE_LIMIT_PER_MINUTE,
+    1200,
+  ),
   stripMaxItems: positiveInt('STRIP_MAX_ITEMS', process.env.STRIP_MAX_ITEMS, 5),
   galleryMaxItems: positiveInt('GALLERY_MAX_ITEMS', process.env.GALLERY_MAX_ITEMS, 25),
   scrapbookPriceIdr: optionalPositiveInt('SCRAPBOOK_PRICE_IDR', process.env.SCRAPBOOK_PRICE_IDR),
@@ -572,6 +628,17 @@ export const env: Env = {
     200,
   ),
   r2: parseR2(),
+}
+
+// Selling and giving away the same thing can't both be on.
+if (env.freeUnlockEnabled && process.env.PAYMENTS_ENABLED?.trim() === 'true') {
+  throw new Error('FREE_UNLOCK_ENABLED and PAYMENTS_ENABLED cannot both be true.')
+}
+// Checkout answers 503 and nothing unlocks, which is safe but silent without this.
+if (process.env.PAYMENTS_ENABLED?.trim() === 'true' && !env.paymentsEnabled) {
+  logger.error('payments.misconfigured', {
+    msg: 'PAYMENTS_ENABLED is on but a Midtrans key is missing; checkout is unavailable.',
+  })
 }
 
 // The first warning goes 14 days before deletion (lib/inactiveAccounts.ts), so a shorter

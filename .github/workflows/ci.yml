@@ -62,6 +62,11 @@ jobs:
       - name: Migrations apply to an empty database
         run: npx prisma migrate deploy
 
+      - name: Checkout, settlement and session tests
+        run: npm run test:db
+        env:
+          TEST_DATABASE_URL: ${{ env.DATABASE_URL }}
+
       - name: Schema matches migrations
         # Exit code 2 = schema.prisma has changes no migration creates. The SQL printed is
         # what the missing migration would contain (`npm run db:migrate` generates it).

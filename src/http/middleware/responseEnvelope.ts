@@ -15,6 +15,11 @@ import type { RequestHandler } from 'express'
  */
 export const responseEnvelope: RequestHandler = (_req, res, next) => {
   const json = res.json.bind(res)
-  res.json = (body?: unknown) => json({ statusCode: res.statusCode, result: body ?? null })
+  res.json = (body?: unknown) => {
+    // Most of these answers are one person's data, so nothing should keep them. A route
+    // that wants its response cached sets its own header first.
+    if (!res.getHeader('Cache-Control')) res.setHeader('Cache-Control', 'no-store')
+    return json({ statusCode: res.statusCode, result: body ?? null })
+  }
   next()
 }

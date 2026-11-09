@@ -1,7 +1,9 @@
 import { Router } from 'express'
 
 import { serializeUser } from '../../auth/serialize.js'
+import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
+import { clientIp, rateLimitKey } from '../../lib/clientIp.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
 import { generateInviteCode } from '../../lib/inviteCode.js'
@@ -15,10 +17,16 @@ export const partnerRouter = Router()
 partnerRouter.use(requireAuth)
 
 const partnerLimiter = new RateLimiter(30, 60_000)
+/**
+ * Wrong codes per address. The limit above is per account, so many throwaway accounts
+ * would multiply it, and a lucky guess links a stranger permanently. Counts misses only:
+ * someone with the right code never gets near it.
+ */
+const inviteGuessLimiter = new RateLimiter(30, 10 * 60_000)
 const INVITE_TTL_MS = 24 * 60 * 60 * 1000
 
 export function sweepPartnerLimits(now: number = Date.now()): number {
-  return partnerLimiter.sweep(now)
+  return partnerLimiter.sweep(now) + inviteGuessLimiter.sweep(now)
 }
 
 /** Deletes expired / used partner invites. Wired into the periodic sweep. */
@@ -71,8 +79,17 @@ partnerRouter.post(
       .trim()
       .toUpperCase()
 
+    // Out of guesses reads as a wrong code, so it says nothing about this one.
+    const guessKey = rateLimitKey(clientIp(req, env.clientIpHeader))
+    if (!inviteGuessLimiter.peek(guessKey)) {
+      logger.warn('partner.accept.guess_limited', { userId: req.userId })
+      res.status(400).json({ error: 'invite_invalid' })
+      return
+    }
+
     const invite = await prisma.partnerInvite.findUnique({ where: { code } })
     if (!invite || invite.usedAt || invite.expiresAt <= new Date()) {
+      inviteGuessLimiter.allow(guessKey)
       res.status(400).json({ error: 'invite_invalid' })
       return
     }
