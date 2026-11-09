@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client'
 import type { ErrorRequestHandler, RequestHandler } from 'express'
 
+import { PasswordHashBusyError } from '../../auth/passwords.js'
 import { logger } from '../../lib/logger.js'
 
 /** Unmatched route — answer with the same JSON error shape as everything else. */
@@ -37,6 +38,13 @@ export const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
     (err as { type?: string }).type === 'entity.too.large'
   ) {
     res.status(413).json({ error: 'payload_too_large' })
+    return
+  }
+
+  // A sign-in rush, already logged where it happened. Nothing is wrong with this request.
+  if (err instanceof PasswordHashBusyError) {
+    res.setHeader('Retry-After', '5')
+    res.status(503).json({ error: 'server_busy' })
     return
   }
 
