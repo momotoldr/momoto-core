@@ -13,7 +13,12 @@ import {
   isResetTokenValid,
   issuePasswordReset,
 } from '../../auth/passwordReset.js'
-import { hashPassword, verifyDecoyPassword, verifyPassword } from '../../auth/passwords.js'
+import {
+  hashPassword,
+  PasswordHashBusyError,
+  verifyDecoyPassword,
+  verifyPassword,
+} from '../../auth/passwords.js'
 import { serializeUser } from '../../auth/serialize.js'
 import {
   issueRefreshToken,
@@ -115,7 +120,13 @@ async function verifyCurrentPassword(
     res.status(429).json({ error: 'too_many_requests' })
     return null
   }
-  const ok = await verifyPassword(hash, plain)
+  let ok: boolean
+  try {
+    ok = await verifyPassword(hash, plain)
+  } catch (err) {
+    if (err instanceof PasswordHashBusyError) reauthFailureLimiter.refund(userId)
+    throw err
+  }
   if (ok) reauthFailureLimiter.reset(userId)
   return ok
 }
@@ -394,9 +405,17 @@ authRouter.post(
 
     // Always spend one argon2 verification, even when there's nothing to verify
     // against — otherwise the response time reveals whether the account exists.
-    const ok = user?.passwordHash
-      ? await verifyPassword(user.passwordHash, password)
-      : await verifyDecoyPassword(password)
+    let ok: boolean
+    try {
+      ok = user?.passwordHash
+        ? await verifyPassword(user.passwordHash, password)
+        : await verifyDecoyPassword(password)
+    } catch (err) {
+      // Turned away in a rush, so the password was never checked. Retrying shouldn't
+      // walk someone toward the account lock.
+      if (err instanceof PasswordHashBusyError) loginFailureLimiter.refund(username)
+      throw err
+    }
 
     if (!user || !ok) {
       res.status(401).json({ error: 'invalid_credentials' })

@@ -33,6 +33,10 @@ export interface Env {
   jwtKeyPair: { privateKey: KeyObject; publicKey: KeyObject } | null
   /** How long an admin stays in after a 6-digit code. */
   adminSessionTtlSeconds: number
+  /** Password hashes running at once. Below the thread pool, so they can't fill it. */
+  passwordHashMaxConcurrent: number
+  /** How long a login may wait for a turn. Under the frontend's 10 s request timeout. */
+  passwordHashMaxWaitMs: number
   jwtAccessTtlSeconds: number
   jwtRefreshTtlSeconds: number
   googleClientId: string | null
@@ -553,6 +557,16 @@ export const env: Env = {
   jwtSecret: requiredSecret('JWT_SECRET', process.env.JWT_SECRET),
   jwtKeyPair: parseJwtKeyPair(process.env.JWT_PRIVATE_KEY),
   adminSessionTtlSeconds: positiveInt('ADMIN_SESSION_TTL', process.env.ADMIN_SESSION_TTL, 28_800),
+  passwordHashMaxConcurrent: positiveInt(
+    'PASSWORD_HASH_MAX_CONCURRENT',
+    process.env.PASSWORD_HASH_MAX_CONCURRENT,
+    3,
+  ),
+  passwordHashMaxWaitMs: positiveInt(
+    'PASSWORD_HASH_MAX_WAIT_MS',
+    process.env.PASSWORD_HASH_MAX_WAIT_MS,
+    8_000,
+  ),
   jwtAccessTtlSeconds: positiveInt('JWT_ACCESS_TTL', process.env.JWT_ACCESS_TTL, 3600),
   jwtRefreshTtlSeconds: positiveInt('JWT_REFRESH_TTL', process.env.JWT_REFRESH_TTL, 604_800),
   googleClientId: process.env.GOOGLE_CLIENT_ID?.trim() || null,
