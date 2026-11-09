@@ -1,7 +1,7 @@
 import { Prisma } from '@prisma/client'
 import type { ErrorRequestHandler, RequestHandler } from 'express'
 
-import { PasswordHashBusyError } from '../../auth/passwords.js'
+import { PasswordHashBusyError } from '../../auth/passwordHashBusyError.js'
 import { logger } from '../../lib/logger.js'
 
 /** Unmatched route — answer with the same JSON error shape as everything else. */

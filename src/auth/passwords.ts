@@ -4,13 +4,9 @@ import argon2 from 'argon2'
 
 import { env } from '../config/env.js'
 import { logger } from '../lib/logger.js'
+import { PasswordHashBusyError } from './passwordHashBusyError.js'
 
-/** Thrown instead of joining a line too long to be worth waiting in. Answered as a 503. */
-export class PasswordHashBusyError extends Error {
-  constructor() {
-    super('password_hash_busy')
-  }
-}
+export { PasswordHashBusyError }
 
 /** How many may wait for a slot. Past this, the answer is "try again", immediately. */
 const MAX_QUEUED = 64
