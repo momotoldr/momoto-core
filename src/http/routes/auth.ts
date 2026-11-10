@@ -7,13 +7,18 @@ import {
   resendClaim,
   verifyEmailClaim,
 } from '../../auth/emailVerification.js'
-import { verifyGoogleIdToken } from '../../auth/google.js'
+import { exchangeGoogleCode, isOwnGoogleCallback } from '../../auth/google.js'
 import {
   consumePasswordReset,
   isResetTokenValid,
   issuePasswordReset,
 } from '../../auth/passwordReset.js'
-import { hashPassword, verifyDecoyPassword, verifyPassword } from '../../auth/passwords.js'
+import {
+  hashPassword,
+  PasswordHashBusyError,
+  verifyDecoyPassword,
+  verifyPassword,
+} from '../../auth/passwords.js'
 import { serializeUser } from '../../auth/serialize.js'
 import {
   issueRefreshToken,
@@ -26,11 +31,12 @@ import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
 import { clientIp, rateLimitKey } from '../../lib/clientIp.js'
 import { isValidEmail, normalizeEmail } from '../../lib/email.js'
+import { noteActivity } from '../../lib/activity.js'
+import { deleteAccount } from '../../lib/deleteAccount.js'
 import { ipPrefix } from '../../lib/ipPrefix.js'
 import { parseLocation } from '../../lib/locations.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
-import { markTestimonialsChanged } from '../../lib/testimonials.js'
 import { sendPasswordChanged } from '../../notifications/client.js'
 import { normalizeLang } from '../../notifications/lang.js'
 import {
@@ -48,7 +54,6 @@ import { signUploadGrant, verifyUploadGrant } from '../../storage/uploadGrant.js
 import { asyncRoute } from '../asyncRoute.js'
 import { readImageSize, sniffImageType } from '../imageType.js'
 import { requireAuth } from '../middleware/requireAuth.js'
-import { deleteStripObjects } from './strips.js'
 
 export const authRouter = Router()
 
@@ -56,8 +61,22 @@ export const authRouter = Router()
 const REFRESH_COOKIE = 'momoto_rt'
 const REFRESH_COOKIE_PATH = '/auth'
 
-/** Tight cap on credential endpoints (login/register/google) to blunt brute force. */
+/** Signups per address: each mints an account and a piece of mail, so it stays tight. */
 const authLimiter = new RateLimiter(20, 60_000)
+/**
+ * Sign-ins per address. Looser than signup because a mobile carrier can put many real
+ * people behind one address, and `loginFailureLimiter` is what actually stops guessing.
+ */
+const loginIpLimiter = new RateLimiter(60, 60_000)
+/**
+ * "That email is already registered" answers per address. The answer is useful to someone
+ * who mistyped, and a lookup service to anyone asking in bulk, so only the bulk is capped.
+ */
+const emailTakenLimiter = new RateLimiter(10, 60 * 60_000)
+/** Setting a first password has no current one to check, but still costs an argon2 hash. */
+const passwordChangeLimiter = new RateLimiter(10, 15 * 60_000)
+/** Completing an avatar upload reads it back and decodes it. */
+const avatarCompleteLimiter = new RateLimiter(40, 10 * 60_000)
 /** Refresh is hit routinely by every active tab; allow more headroom. */
 const refreshLimiter = new RateLimiter(60, 60_000)
 /**
@@ -65,13 +84,52 @@ const refreshLimiter = new RateLimiter(60, 60_000)
  * nothing against a password spray spread over many addresses, which is how
  * credential stuffing actually arrives.
  *
- * Only failures count and a success clears the counter, so a user who knows their
- * password is never affected. The residual trade-off is that someone who knows a
- * username can deliberately burn the budget and lock that account out for the
- * window — which is why this is a generous 10 per 15 minutes rather than a tight
- * lockout, and why it expires on its own instead of needing an unlock.
+ * Every attempt is counted *before* the password check and a success clears the
+ * counter, so in effect only failures count and a user who knows their password is
+ * never affected. Counting up front matters: argon2 takes ~100ms, and if the hit were
+ * only spent on the failure path, a burst of parallel guesses from many addresses
+ * would all pass the budget check before the first one failed.
+ *
+ * The residual trade-off is that someone who knows a username can deliberately burn
+ * the budget and lock that account out for the window — which is why this is a
+ * generous 10 per 15 minutes rather than a tight lockout, and why it expires on its
+ * own instead of needing an unlock.
  */
 const loginFailureLimiter = new RateLimiter(10, 15 * 60_000)
+/**
+ * Wrong current-password answers per *signed-in user*, on the routes that re-ask for
+ * it (`POST /auth/me/password`, `DELETE /auth/me`). Those exist so a session left on a
+ * shared device can't lock out or erase the owner — but without a budget, whoever holds
+ * that session could guess the password there, unthrottled. Same count-first,
+ * clear-on-success shape as `loginFailureLimiter`.
+ */
+const reauthFailureLimiter = new RateLimiter(10, 15 * 60_000)
+
+/**
+ * Checks a signed-in user's current password against `reauthFailureLimiter`. Answers
+ * 429 itself when the budget is spent and returns null; otherwise returns the verdict.
+ */
+async function verifyCurrentPassword(
+  res: Response,
+  userId: string,
+  hash: string,
+  plain: string,
+): Promise<boolean | null> {
+  if (!reauthFailureLimiter.allow(userId)) {
+    logger.warn('auth.reauth.locked', { userId })
+    res.status(429).json({ error: 'too_many_requests' })
+    return null
+  }
+  let ok: boolean
+  try {
+    ok = await verifyPassword(hash, plain)
+  } catch (err) {
+    if (err instanceof PasswordHashBusyError) reauthFailureLimiter.refund(userId)
+    throw err
+  }
+  if (ok) reauthFailureLimiter.reset(userId)
+  return ok
+}
 
 /**
  * Mail-sending endpoints, capped harder than the rest — every allowed call puts a
@@ -79,6 +137,13 @@ const loginFailureLimiter = new RateLimiter(10, 15 * 60_000)
  */
 const emailClaimLimiter = new RateLimiter(5, 60 * 60_000)
 const resendLimiter = new RateLimiter(3, 60 * 60_000)
+/**
+ * Verification mail per *address*, across every account and source. Both limits above and
+ * the per-IP cap on signup leave a gap: each new account gets a fresh budget, so a script
+ * could register over and over to flood one stranger's inbox and spend our sender
+ * reputation doing it.
+ */
+const addressMailLimiter = new RateLimiter(5, 60 * 60_000)
 /** Reset requests per source IP. */
 const forgotIpLimiter = new RateLimiter(5, 15 * 60_000)
 /**
@@ -94,11 +159,17 @@ const resetTokenLimiter = new RateLimiter(20, 15 * 60_000)
 export function sweepAuthLimits(now: number = Date.now()): number {
   return (
     authLimiter.sweep(now) +
+    loginIpLimiter.sweep(now) +
+    emailTakenLimiter.sweep(now) +
+    passwordChangeLimiter.sweep(now) +
+    avatarCompleteLimiter.sweep(now) +
     refreshLimiter.sweep(now) +
     loginFailureLimiter.sweep(now) +
+    reauthFailureLimiter.sweep(now) +
     avatarLimiter.sweep(now) +
     emailClaimLimiter.sweep(now) +
     resendLimiter.sweep(now) +
+    addressMailLimiter.sweep(now) +
     forgotIpLimiter.sweep(now) +
     forgotAccountLimiter.sweep(now) +
     resetTokenLimiter.sweep(now)
@@ -106,6 +177,8 @@ export function sweepAuthLimits(now: number = Date.now()): number {
 }
 
 const MIN_PASSWORD = 8
+/** Past any username or email address we hold. Bounds what becomes a limiter key. */
+const MAX_LOGIN_IDENTIFIER = 254
 const MAX_DISPLAY_NAME = 60
 /** Usernames are alphanumeric only (no special characters), 3–20 chars. */
 const USERNAME_RE = /^[a-z0-9]{3,20}$/
@@ -174,9 +247,18 @@ function refreshCookieOptions(expiresAt?: Date): CookieOptions {
   }
 }
 
-/** Issues a fresh session (refresh cookie + access token) and returns the payload. */
-async function establishSession(res: Response, userId: string): Promise<{ accessToken: string }> {
+/**
+ * Issues a fresh session (refresh cookie + access token) and returns the payload. Every
+ * new session is activity for the inactive-account clock; `rawLang` is the request's
+ * `lang`, when it sent one (see lib/activity.ts).
+ */
+async function establishSession(
+  res: Response,
+  userId: string,
+  rawLang?: unknown,
+): Promise<{ accessToken: string }> {
   const { raw, expiresAt } = await issueRefreshToken(userId)
+  noteActivity(userId, rawLang)
   res.cookie(REFRESH_COOKIE, raw, refreshCookieOptions(expiresAt))
   return { accessToken: signAccessToken(userId) }
 }
@@ -226,8 +308,13 @@ authRouter.post(
     // Advisory: refuse early when a *proven* account already holds this address, so
     // the user fixes it here instead of getting a verification link that can never
     // succeed. Not the real guard — the unique index at verification time is.
+    const probeKey = rateLimitKey(ip)
+    if (!emailTakenLimiter.peek(probeKey)) {
+      return void limited(res, 'auth.register.email_probe_limited', ip)
+    }
     const emailHolder = await prisma.user.findUnique({ where: { email } })
     if (emailHolder?.emailVerifiedAt) {
+      emailTakenLimiter.allow(probeKey)
       res.status(409).json({ error: 'email_taken' })
       return
     }
@@ -238,6 +325,12 @@ authRouter.post(
     if (existing) {
       res.status(409).json({ error: 'username_taken' })
       return
+    }
+
+    // Past the two checks a person retrying the form would trip, so only attempts that
+    // would really send mail spend this budget.
+    if (!addressMailLimiter.allow(email)) {
+      return void limited(res, 'auth.register.address_limited', ip)
     }
 
     // The check above is advisory only: hashing takes ~100ms, and two concurrent
@@ -272,7 +365,7 @@ authRouter.post(
     // successful signup into an error. `sendMail` already swallows its own failures.
     await claimEmail(user.id, email, lang)
 
-    const { accessToken } = await establishSession(res, user.id)
+    const { accessToken } = await establishSession(res, user.id, req.body?.lang)
     res.status(201).json({ user: serializeUser(user, email), accessToken })
   }),
 )
@@ -282,17 +375,27 @@ authRouter.post(
   '/login',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
-    if (!authLimiter.allow(rateLimitKey(ip))) return void limited(res, 'auth.login.ratelimited', ip)
+    if (!loginIpLimiter.allow(rateLimitKey(ip))) {
+      return void limited(res, 'auth.login.ratelimited', ip)
+    }
 
     const username = String(req.body?.username ?? '')
       .trim()
       .toLowerCase()
     const password = String(req.body?.password ?? '')
 
-    // Per-account failure budget, checked without spending a hit (only failures below
-    // count). Answer 429 rather than 401 so a legitimate user learns to wait instead
-    // of retyping a password that would have worked.
-    if (!loginFailureLimiter.peek(username)) {
+    // No account has a name this long, and the name becomes a limiter key below, where a
+    // 64 KB string would sit in memory for the whole window.
+    if (username.length > MAX_LOGIN_IDENTIFIER) {
+      res.status(401).json({ error: 'invalid_credentials' })
+      return
+    }
+
+    // Per-account failure budget. The hit is spent here, before argon2, so parallel
+    // guesses can't all slip past the check; a success below refunds it by clearing
+    // the counter. Answer 429 rather than 401 so a legitimate user learns to wait
+    // instead of retyping a password that would have worked.
+    if (!loginFailureLimiter.allow(username)) {
       logger.warn('auth.login.account_locked', { ipPrefix: ipPrefix(ip) })
       res.status(429).json({ error: 'too_many_requests' })
       return
@@ -302,39 +405,54 @@ authRouter.post(
 
     // Always spend one argon2 verification, even when there's nothing to verify
     // against — otherwise the response time reveals whether the account exists.
-    const ok = user?.passwordHash
-      ? await verifyPassword(user.passwordHash, password)
-      : await verifyDecoyPassword(password)
+    let ok: boolean
+    try {
+      ok = user?.passwordHash
+        ? await verifyPassword(user.passwordHash, password)
+        : await verifyDecoyPassword(password)
+    } catch (err) {
+      // Turned away in a rush, so the password was never checked. Retrying shouldn't
+      // walk someone toward the account lock.
+      if (err instanceof PasswordHashBusyError) loginFailureLimiter.refund(username)
+      throw err
+    }
 
     if (!user || !ok) {
-      loginFailureLimiter.allow(username)
       res.status(401).json({ error: 'invalid_credentials' })
       return
     }
 
     loginFailureLimiter.reset(username)
-    const { accessToken } = await establishSession(res, user.id)
+    const { accessToken } = await establishSession(res, user.id, req.body?.lang)
     res.json({ user: serializeUser(user), accessToken })
   }),
 )
+
+/** RFC 7636: a PKCE code verifier is 43–128 characters of this alphabet. */
+const PKCE_VERIFIER = /^[A-Za-z0-9\-._~]{43,128}$/
 
 // ── POST /auth/google ────────────────────────────────────────────────────────
 authRouter.post(
   '/google',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
-    if (!authLimiter.allow(rateLimitKey(ip)))
+    if (!loginIpLimiter.allow(rateLimitKey(ip)))
       return void limited(res, 'auth.google.ratelimited', ip)
 
-    const idToken = String(req.body?.idToken ?? '')
-    if (!idToken) {
+    // From the FE's redirect sign-in (its /auth/google/callback page): the code, the
+    // redirect URI it started from, and its PKCE verifier. Nothing else is accepted — in
+    // particular not a bare ID token, which would make any leaked one a login.
+    const code = String(req.body?.code ?? '')
+    const redirectUri = String(req.body?.redirectUri ?? '')
+    const codeVerifier = String(req.body?.codeVerifier ?? '')
+    if (!code || !isOwnGoogleCallback(redirectUri) || !PKCE_VERIFIER.test(codeVerifier)) {
       res.status(400).json({ error: 'invalid_input' })
       return
     }
 
     let identity
     try {
-      identity = await verifyGoogleIdToken(idToken)
+      identity = await exchangeGoogleCode(code, redirectUri, codeVerifier)
     } catch (err) {
       const code = err instanceof Error ? err.message : 'invalid_google_token'
       res.status(code === 'google_not_configured' ? 503 : 401).json({ error: code })
@@ -348,6 +466,25 @@ authRouter.post(
     })
     if (!user) {
       const byEmail = await prisma.user.findUnique({ where: { email: identity.email } })
+
+      // Linking a Google account into an existing Momoto account hands over everything in
+      // it, so it happens only when the address proves the same person. Two refusals:
+      if (byEmail?.googleId) {
+        // That account already belongs to a *different* Google account (this one's id
+        // matched nothing above). Re-pointing it would lock its owner's Google login out
+        // and give the account to whoever holds the address now.
+        logger.warn('auth.google.link_refused', { userId: byEmail.id, reason: 'other_google' })
+        res.status(409).json({ error: 'google_other_account' })
+        return
+      }
+      if (byEmail && !identity.emailAuthoritative) {
+        // Google confirmed this non-Gmail, non-Workspace address once, at signup; it
+        // doesn't vouch for who holds it today (a lapsed, re-registered domain). The
+        // account's owner still has their password.
+        logger.warn('auth.google.link_refused', { userId: byEmail.id, reason: 'not_authoritative' })
+        res.status(409).json({ error: 'google_email_in_use' })
+        return
+      }
       // Closed beta: Google may still *authenticate* an account that already exists —
       // anyone already linked keeps their way in — but it may no longer *create* one.
       // Without this, `/auth/register` being shut means nothing: this route is the other
@@ -359,7 +496,7 @@ authRouter.post(
       }
 
       // Google is the one source we take an address from without mailing our own
-      // link: `verifyGoogleIdToken` rejects any token whose `email_verified` isn't
+      // link: `exchangeGoogleCode` rejects any token whose `email_verified` isn't
       // true, so the mailbox was proven before it reached us. Stamping
       // `emailVerifiedAt` here is what lets these accounts reset their password.
       user = byEmail
@@ -387,7 +524,7 @@ authRouter.post(
     }
     logger.info('auth.google', { userId: user.id })
 
-    const { accessToken } = await establishSession(res, user.id)
+    const { accessToken } = await establishSession(res, user.id, req.body?.lang)
     res.json({ user: serializeUser(user), accessToken })
   }),
 )
@@ -407,7 +544,14 @@ authRouter.post(
     }
 
     const rotated = await rotateRefreshToken(raw)
-    if (!rotated) {
+    // Another tab refreshed with this cookie a moment ago and has the new one. Clearing it
+    // here would delete that tab's fresh session, so answer without touching the cookie
+    // and let the client try again.
+    if (rotated.status === 'race') {
+      res.status(409).json({ error: 'refresh_race' })
+      return
+    }
+    if (rotated.status === 'invalid') {
       res.clearCookie(REFRESH_COOKIE, refreshCookieOptions())
       res.status(401).json({ error: 'unauthorized' })
       return
@@ -422,6 +566,9 @@ authRouter.post(
       res.status(401).json({ error: 'unauthorized' })
       return
     }
+    // A refresh is the app being opened (or kept open) signed in. Throttled to one write
+    // a day inside, so the hourly-per-tab rate doesn't reach the database.
+    noteActivity(user.id, req.body?.lang)
     // Carry `pendingEmail` on the refresh path too. It costs one indexed lookup per
     // access-token expiry (an hour, per tab), and without it a refresh would quietly
     // replace the store's user with one that has forgotten it is mid-verification —
@@ -475,6 +622,11 @@ authRouter.post(
     const email = normalizeEmail(req.body?.email)
     if (!isValidEmail(email)) {
       res.status(400).json({ error: 'invalid_input' })
+      return
+    }
+
+    if (!addressMailLimiter.allow(email)) {
+      res.status(429).json({ error: 'too_many_requests' })
       return
     }
 
@@ -576,13 +728,23 @@ authRouter.post(
       res.status(400).json({ error: 'invalid_input' })
       return
     }
+    if (!passwordChangeLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
 
     // An account with a password must re-supply it — same reasoning as
     // `DELETE /auth/me`: an access token left behind on a shared device shouldn't be
     // enough to lock the real owner out. A Google-only account has nothing to
     // re-supply, so for them this route *sets* a first password.
     if (user.passwordHash) {
-      const ok = await verifyPassword(user.passwordHash, String(req.body?.currentPassword ?? ''))
+      const ok = await verifyCurrentPassword(
+        res,
+        userId,
+        user.passwordHash,
+        String(req.body?.currentPassword ?? ''),
+      )
+      if (ok === null) return
       if (!ok) {
         res.status(403).json({ error: 'invalid_password' })
         return
@@ -598,7 +760,7 @@ authRouter.post(
     // to evict anyone else holding a session, not to log the user out of the tab
     // they just used to succeed.
     const revoked = await revokeAllForUser(userId)
-    const { accessToken } = await establishSession(res, userId)
+    const { accessToken } = await establishSession(res, userId, req.body?.lang)
     logger.info('auth.password.changed', { userId, sessionsRevoked: revoked })
 
     // **The one mail that tells a victim something happened.** Revoking every session
@@ -642,7 +804,11 @@ authRouter.post(
 
     // Accepted and answered identically even when malformed — a 400 here would say
     // "that isn't one of ours", which is the same leak by another route.
-    if (identifier && forgotAccountLimiter.allow(identifier)) {
+    if (
+      identifier &&
+      identifier.length <= MAX_LOGIN_IDENTIFIER &&
+      forgotAccountLimiter.allow(identifier)
+    ) {
       // Sign-in is username-first, but people remember their email. Take either.
       const user = identifier.includes('@')
         ? await prisma.user.findUnique({ where: { email: identifier } })
@@ -660,18 +826,21 @@ authRouter.post(
   }),
 )
 
-// ── GET /auth/reset-password ─── is this link still good? ────────────────────
+// ── POST /auth/reset-password/check ─── is this link still good? ─────────────
 //
 // Returns a bare boolean: never the address, never the username. Someone holding a
 // spent token should not be able to learn whose account it was.
-authRouter.get(
-  '/reset-password',
+//
+// A POST with the token in the body because a query string ends up in access logs, and
+// this token can take over an account.
+authRouter.post(
+  '/reset-password/check',
   asyncRoute(async (req, res) => {
     const ip = clientIp(req, env.clientIpHeader) ?? 'unknown'
     if (!resetTokenLimiter.allow(rateLimitKey(ip)))
       return void limited(res, 'auth.reset.ratelimited', ip)
 
-    const token = typeof req.query.token === 'string' ? req.query.token : ''
+    const token = typeof req.body?.token === 'string' ? req.body.token : ''
     res.json({ valid: token ? await isResetTokenValid(token) : false })
   }),
 )
@@ -981,6 +1150,10 @@ authRouter.post(
       res.status(409).json({ error: 'direct_upload_unavailable' })
       return
     }
+    if (!avatarCompleteLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
     const grant = verifyUploadGrant(
       (req.body as { token?: unknown } | undefined)?.token,
       'avatar',
@@ -1058,11 +1231,9 @@ authRouter.delete(
 // Self-service account deletion. For an account that has a password, we re-verify
 // it here: an access token alone (which could be lingering on a shared device)
 // shouldn't be enough to erase an account. Google-only accounts have no password to
-// check — the valid session is the proof. Payments don't block it. The delete cascades
-// the user's strip rows, refresh tokens and partner invites, unlinks any partner, and
-// detaches feedback (kept for triage) and payments (the record of money received — there
-// are no refunds). The strips' images and the avatar live in object storage, which
-// doesn't cascade — they're deleted after.
+// check — the valid session is the proof. Payments don't block it. What the delete
+// removes and detaches is `deleteAccount`'s job (lib/deleteAccount.ts), shared with the
+// admin route and the inactive-account job.
 authRouter.delete(
   '/me',
   requireAuth,
@@ -1070,9 +1241,7 @@ authRouter.delete(
     const userId = req.userId as string
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      // `avatarKey` because the row cascades away but the object it names doesn't —
-      // read it while the row still exists.
-      select: { passwordHash: true, avatarKey: true },
+      select: { passwordHash: true },
     })
     if (!user) {
       res.status(401).json({ error: 'unauthorized' })
@@ -1081,32 +1250,15 @@ authRouter.delete(
 
     if (user.passwordHash) {
       const password = String(req.body?.password ?? '')
-      const ok = await verifyPassword(user.passwordHash, password)
+      const ok = await verifyCurrentPassword(res, userId, user.passwordHash, password)
+      if (ok === null) return
       if (!ok) {
         res.status(403).json({ error: 'invalid_password' })
         return
       }
     }
 
-    // Strip rows cascade with the account, but the images they point at don't — collect
-    // the keys before the rows are gone, as `DELETE /admin/users/:id` does. Without this,
-    // every self-deleted account left its strips in both buckets with no row naming them.
-    const strips = await prisma.strip.findMany({
-      where: { userId },
-      select: {
-        storageKey: true,
-        thumbnailKey: true,
-        printImage: { select: { storageKey: true } },
-      },
-    })
-
-    await prisma.user.delete({ where: { id: userId } })
-    // Their testimonials cascaded away (or dropped them as a partner) — refresh the landing cache.
-    markTestimonialsChanged()
-    // Best-effort, after the row is gone: a failure is logged, and the account is deleted
-    // either way.
-    await deleteStripObjects(strips)
-    if (user.avatarKey) await deleteImages('avatar', [user.avatarKey])
+    await deleteAccount(userId, 'self')
     res.clearCookie(REFRESH_COOKIE, refreshCookieOptions())
     logger.info('auth.account.deleted', { userId })
     res.status(204).end()

@@ -1,28 +1,64 @@
 import { randomUUID } from 'node:crypto'
 
+import type { Prisma } from '@prisma/client'
 import { Router } from 'express'
 
 import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
+import { clientIp, rateLimitKey } from '../../lib/clientIp.js'
+import { ipPrefix } from '../../lib/ipPrefix.js'
 import { logger } from '../../lib/logger.js'
+import { sendPaymentReceipt } from '../../notifications/client.js'
+import { normalizeLang } from '../../notifications/lang.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
 import {
+  cancelTransaction,
+  chargeTotal,
   chargeTransaction,
+  enabledPaymentMethods,
+  fetchTransactionStatus,
   isPaymentMethod,
+  midtransErrorStatus,
   verifyNotificationSignature,
 } from '../../payments/midtrans.js'
+import {
+  adminFeesFor,
+  applyPromosOnSettlement,
+  quoteOrder,
+  sameQuote,
+} from '../../promos/promos.js'
 import { asyncRoute } from '../asyncRoute.js'
 import { requireAuth } from '../middleware/requireAuth.js'
+import {
+  coverUrlOf,
+  findPurchasableScrapbook,
+  hasLivePayment,
+  lockScrapbook,
+} from './scrapbooks.js'
 import { findPurchasableStrips, galleryRoomFor, refusePurchase } from './strips.js'
 
 export const paymentsRouter = Router()
 
 /** Rate-limit checkout creation per user (each mints a Midtrans transaction). */
 const checkoutLimiter = new RateLimiter(20, 10 * 60_000)
+/** Quotes are re-asked on every change to the cart's selection, so a looser bound. */
+const quoteLimiter = new RateLimiter(240, 10 * 60_000)
+/** "I've paid" checks and cancels each ask Midtrans, so a tight bound. */
+const statusCheckLimiter = new RateLimiter(10, 10 * 60_000)
+/** Saving the QR makes this server fetch it from Midtrans each time. */
+const qrLimiter = new RateLimiter(30, 10 * 60_000)
+/** The webhook is public: anyone can fail its signature, as fast as they like. */
+const badSignatureLogLimiter = new RateLimiter(5, 60_000)
 
 /** Reclaim expired checkout rate windows (wired into the periodic sweep). */
 export function sweepPaymentLimits(now: number = Date.now()): number {
-  return checkoutLimiter.sweep(now)
+  return (
+    checkoutLimiter.sweep(now) +
+    quoteLimiter.sweep(now) +
+    statusCheckLimiter.sweep(now) +
+    qrLimiter.sweep(now) +
+    badSignatureLogLimiter.sweep(now)
+  )
 }
 
 /**
@@ -46,9 +82,20 @@ function serializePayment(payment: {
   qrImageUrl: string | null
   deeplinkUrl: string | null
   expiresAt: Date | null
+  bogo: boolean
+  bundles: number
+  adminFee: number
   strips: { id: string }[]
+  scrapbooks: { id: string }[]
 }) {
   return {
+    // What the order is for: since 2026-10-17 one cart checkout can hold both kinds.
+    kind:
+      payment.scrapbooks.length === 0
+        ? ('strips' as const)
+        : payment.strips.length === 0
+          ? ('scrapbook' as const)
+          : ('mixed' as const),
     orderId: payment.orderId,
     status: payment.status,
     grossAmount: payment.grossAmount,
@@ -57,7 +104,14 @@ function serializePayment(payment: {
     deeplinkUrl: payment.deeplinkUrl,
     expiresAt: payment.expiresAt?.toISOString() ?? null,
     stripIds: payment.strips.map((strip) => strip.id),
+    scrapbookIds: payment.scrapbooks.map((scrapbook) => scrapbook.id),
+    // Strips only, as it always was: the cart's "n strips" line reads it.
     count: payment.strips.length,
+    // The promos it was priced with (docs/PLAN-promos.md), for the modal's summary.
+    bogo: payment.bogo,
+    bundled: payment.bundles,
+    // Already inside `grossAmount`; the modal names it under the total.
+    adminFee: payment.adminFee,
   }
 }
 
@@ -70,7 +124,11 @@ const PAYMENT_SELECT = {
   qrImageUrl: true,
   deeplinkUrl: true,
   expiresAt: true,
+  bogo: true,
+  bundles: true,
+  adminFee: true,
   strips: { select: { id: true } },
+  scrapbooks: { select: { id: true } },
 } as const
 
 /**
@@ -81,8 +139,12 @@ const PAYMENT_SELECT = {
  * and that POST landing, the row still says `pending` — resuming it would show a QR
  * that can no longer be paid.
  */
-function findLivePayment(userId: string, now: Date = new Date()) {
-  return prisma.payment.findFirst({
+function findLivePayment(
+  userId: string,
+  now: Date = new Date(),
+  db: Prisma.TransactionClient = prisma,
+) {
+  return db.payment.findFirst({
     where: { userId, status: 'pending', expiresAt: { gt: now } },
     orderBy: { createdAt: 'desc' },
     select: PAYMENT_SELECT,
@@ -91,10 +153,28 @@ function findLivePayment(userId: string, now: Date = new Date()) {
 
 // ── POST /payments/charge ─── open a payment on one channel ──────────────────
 /**
- * Charge the strips the user selected in the cart, on the channel they picked. The
- * amount is `count × STRIP_PRINT_PRICE_IDR`, computed here and never trusted from the
- * client. Returns the artifacts our own checkout modal renders — a QR image, a wallet
+ * Charge what the user selected in the cart — strips, finished scrapbooks, or both in one
+ * order (user decision, 2026-10-17) — on the channel they picked. Body:
+ * `{ stripIds?, scrapbookIds?, method }`, at least one id between them.
+ *
+ * The amount is `strips × STRIP_PRINT_PRICE_IDR + scrapbooks × SCRAPBOOK_PRICE_IDR` with
+ * the soft-launch promos applied (`quoteOrder`, docs/PLAN-promos.md): one scrapbook + 3 of
+ * the order's unpaid strips at the bundle price, then two strips for one on an unused
+ * partner reward. The method's admin fee (`ADMIN_FEE_<METHOD>`) goes on top as its own
+ * line, on the discounted amount.
+ * Computed here and never trusted from the client, and sent to Midtrans as one line per
+ * kind. The promos are applied, not requested — each only lowers a line. Returns the artifacts our own checkout modal renders — a QR image, a wallet
  * deeplink, or both — rather than a hosted-popup token.
+ *
+ * Everything is checked before Midtrans is called, so an obvious refusal costs no
+ * transaction. Scrapbooks are checked a second time **under their row locks** when the
+ * payment is recorded, because the Midtrans call takes seconds and can't sit inside a
+ * database transaction: a reopen (which deletes the PDF) or a second tab's checkout could
+ * land in between, and either would leave money able to settle on a scrapbook with
+ * nothing to download. If that second check fails, the transaction just opened is
+ * cancelled at Midtrans — its QR was never sent to anyone — and the request is refused as
+ * the first check would have been. (Strips need no second look: nothing between the two
+ * moments can make a strip unsellable that the webhook can't live with.)
  */
 paymentsRouter.post(
   '/charge',
@@ -110,24 +190,49 @@ paymentsRouter.post(
       return
     }
 
-    const body = req.body as { stripIds?: unknown; method?: unknown }
+    const body = req.body as {
+      stripIds?: unknown
+      scrapbookIds?: unknown
+      method?: unknown
+      lang?: unknown
+    }
     if (!isPaymentMethod(body.method)) {
       res.status(400).json({ error: 'invalid_method' })
       return
     }
     const method = body.method
+    // A known channel switched off here (MIDTRANS_ENABLED_PAYMENTS) — a cart that loaded
+    // before it was, or a hand-made request.
+    if (!enabledPaymentMethods().includes(method)) {
+      res.status(400).json({ error: 'method_unavailable' })
+      return
+    }
 
-    // De-dupe + validate the requested ids.
-    const stripIds = Array.isArray(body.stripIds)
-      ? [...new Set(body.stripIds.filter((id): id is string => typeof id === 'string'))]
-      : []
-    if (stripIds.length === 0 || stripIds.length > MAX_CHECKOUT_STRIPS) {
+    const stripIds = readIds(body.stripIds)
+    // Sorted: the row locks below are taken in this order, so two checkouts naming the
+    // same scrapbooks can't deadlock on each other.
+    const scrapbookIds = readIds(body.scrapbookIds)?.sort()
+    if (
+      !stripIds ||
+      !scrapbookIds ||
+      stripIds.length + scrapbookIds.length === 0 ||
+      stripIds.length > MAX_CHECKOUT_STRIPS ||
+      scrapbookIds.length > env.scrapbookMaxItems
+    ) {
       res.status(400).json({ error: 'invalid_input' })
       return
     }
 
+    // No default price on purpose (see `env.scrapbookPriceIdr`): unset, nothing is charged.
+    const scrapbookPrice = env.scrapbookPriceIdr
+    if (scrapbookIds.length > 0 && scrapbookPrice === null) {
+      logger.warn('payments.charge.scrapbookPriceUnset', { userId })
+      res.status(503).json({ error: 'scrapbook_price_unset' })
+      return
+    }
+
     // One live attempt at a time. Charging again while a QR is still payable would let
-    // two orders settle for the same strips — the second one paying for nothing, since
+    // two orders settle for the same items — the second one paying for nothing, since
     // the first already unlocked them. The client resumes the existing attempt instead.
     const live = await findLivePayment(userId)
     if (live) {
@@ -137,22 +242,33 @@ paymentsRouter.post(
     }
 
     // Every strip must be the caller's, unpaid, and have a clean copy to deliver. Shared
-    // with the free unlock path so both refuse on identical grounds — and refuse here,
-    // before a Midtrans transaction exists, so nothing has been charged.
-    const purchasable = await findPurchasableStrips(userId, stripIds)
-    if (!purchasable.ok) {
-      refusePurchase(res, 'charge', userId, purchasable)
-      return
+    // with the free unlock path so both refuse on identical grounds.
+    if (stripIds.length > 0) {
+      const purchasable = await findPurchasableStrips(userId, stripIds)
+      if (!purchasable.ok) {
+        refusePurchase(res, 'charge', userId, purchasable)
+        return
+      }
+      // The gallery has to be able to hold what this payment would unlock. Refusing here
+      // means no Midtrans transaction exists — the only place this check is safe to make.
+      // (The webhook deliberately does not repeat it.) Scrapbooks don't live in the
+      // gallery, so only the strips count.
+      const room = await galleryRoomFor(userId, stripIds.length)
+      if (!room.ok) {
+        logger.info('gallery.full', { userId, used: room.used, limit: room.limit })
+        res.status(409).json({ error: 'gallery_full', used: room.used, limit: room.limit })
+        return
+      }
     }
-    const { strips } = purchasable
 
-    // The gallery has to be able to hold what this payment would unlock. Refusing here
-    // means no Midtrans transaction exists and nothing has been charged — the only place
-    // this check is safe to make. (The webhook deliberately does not repeat it.)
-    const room = await galleryRoomFor(userId, strips.length)
-    if (!room.ok) {
-      logger.info('gallery.full', { userId, used: room.used, limit: room.limit })
-      res.status(409).json({ error: 'gallery_full', used: room.used, limit: room.limit })
+    const scrapbookRefusal = await refuseScrapbooks(userId, scrapbookIds)
+    if (scrapbookRefusal) {
+      logger.info('scrapbooks.notPurchasable', {
+        route: 'charge',
+        userId,
+        error: scrapbookRefusal.error,
+      })
+      res.status(scrapbookRefusal.status).json({ error: scrapbookRefusal.error })
       return
     }
 
@@ -160,42 +276,193 @@ paymentsRouter.post(
       where: { id: userId },
       select: { displayName: true, email: true },
     })
-
-    const unitPrice = env.stripPrintPriceIdr
-    const grossAmount = unitPrice * strips.length
+    const quote = await quoteOrder(userId, stripIds.length, scrapbookIds.length, method)
+    const { items } = quote
+    const grossAmount = chargeTotal(items)
     const orderId = `pay_${randomUUID()}`
 
-    const charge = await chargeTransaction({
-      orderId,
-      unitPrice,
-      quantity: strips.length,
-      itemName: 'Momoto strip print',
-      customer: { name: user?.displayName ?? 'Momoto user', email: user?.email ?? null },
-      method,
+    let charge
+    try {
+      charge = await chargeTransaction({
+        orderId,
+        items,
+        returnPath: '/cart',
+        customer: { name: user?.displayName ?? 'Momoto user', email: user?.email ?? null },
+        method,
+      })
+    } catch (error) {
+      const status = midtransErrorStatus(error)
+      logger.warn('payments.charge.midtransFailed', { userId, orderId, status, err: String(error) })
+      // No answer at all (a timeout, a dropped connection) means the transaction may exist
+      // at Midtrans. Its QR was never shown to anyone, so this is only tidying up.
+      if (status === null) void cancelTransaction(orderId).catch(() => undefined)
+      res.status(502).json({ error: 'midtrans_unavailable' })
+      return
+    }
+
+    const refuse = (refusal: ChargeRefusal) => ({ ok: false as const, refusal })
+    const recorded = await prisma.$transaction(async (tx) => {
+      // One buyer's checkouts go through here one at a time. The live-payment check above
+      // ran before the seconds-long Midtrans call, so a second request (another tab, or a
+      // retry after the client timed out) could pass it too. Without this each would
+      // record a payable order for the same strips, and each could be priced with the
+      // same partner reward. Taken before the scrapbook locks, always in this order.
+      await tx.$queryRaw`SELECT 1 FROM "User" WHERE "id" = ${userId} FOR NO KEY UPDATE`
+      const concurrent = await findLivePayment(userId, new Date(), tx)
+      if (concurrent) {
+        return refuse({
+          status: 409,
+          error: 'payment_in_progress',
+          payment: serializePayment(concurrent),
+        })
+      }
+      for (const id of scrapbookIds) await lockScrapbook(tx, id)
+      const refusal = await refuseScrapbooks(userId, scrapbookIds, tx)
+      if (refusal) return refuse(refusal)
+      // The promos too: the Midtrans call took seconds, and the price it was opened at
+      // must still be the price. Anything that moved it (a reward spent by a late
+      // settlement, a promo switched off) abandons this attempt like any other refusal;
+      // the cart re-quotes on the retry.
+      const requote = await quoteOrder(userId, stripIds.length, scrapbookIds.length, method, tx)
+      if (!sameQuote(quote, requote)) {
+        return refuse({ status: 409, error: 'price_changed' })
+      }
+      const payment = await tx.payment.create({
+        data: {
+          orderId,
+          userId,
+          grossAmount,
+          paymentType: method,
+          qrImageUrl: charge.qrImageUrl,
+          deeplinkUrl: charge.deeplinkUrl,
+          expiresAt: charge.expiresAt,
+          midtransStatus: charge.transactionStatus,
+          // For the receipt the webhook sends: it has no request of the payer's to read.
+          lang: normalizeLang(body.lang),
+          bogo: quote.bogo,
+          bundles: quote.bundles,
+          adminFee: quote.adminFee,
+          strips: { connect: stripIds.map((id) => ({ id })) },
+          scrapbooks: { connect: scrapbookIds.map((id) => ({ id })) },
+        },
+        select: PAYMENT_SELECT,
+      })
+      return { ok: true as const, payment }
     })
 
-    const payment = await prisma.payment.create({
-      data: {
-        orderId,
-        userId,
-        grossAmount,
-        paymentType: method,
-        qrImageUrl: charge.qrImageUrl,
-        deeplinkUrl: charge.deeplinkUrl,
-        expiresAt: charge.expiresAt,
-        midtransStatus: charge.transactionStatus,
-        strips: { connect: strips.map((s) => ({ id: s.id })) },
-      },
-      select: PAYMENT_SELECT,
-    })
+    if (!recorded.ok) {
+      try {
+        await cancelTransaction(orderId)
+      } catch (error) {
+        // Unrecorded and never shown, so it can't be paid; it expires on its own.
+        logger.warn('payments.charge.cancelFailed', { orderId, err: String(error) })
+      }
+      const { status, error, payment } = recorded.refusal
+      logger.info('payments.charge.abandoned', { userId, orderId, error })
+      // `payment` is the attempt that won, in the shape the client resumes from.
+      res.status(status).json({ error, ...(payment ? { payment } : {}) })
+      return
+    }
     logger.info('payments.charge.created', {
       userId,
       orderId,
       method,
-      count: strips.length,
+      strips: stripIds.length,
+      scrapbooks: scrapbookIds.length,
       grossAmount,
+      adminFee: quote.adminFee,
+      bogo: quote.bogo,
+      bundles: quote.bundles,
     })
-    res.status(201).json(serializePayment(payment))
+    res.status(201).json(serializePayment(recorded.payment))
+  }),
+)
+
+/** Why `/charge` abandoned an attempt, with the winning attempt when another one won. */
+interface ChargeRefusal {
+  status: number
+  error: string
+  payment?: ReturnType<typeof serializePayment>
+}
+
+/** A list of ids from the body, de-duplicated; absent is empty, anything else is null. */
+function readIds(value: unknown): string[] | null {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) return null
+  return [...new Set(value.filter((id): id is string => typeof id === 'string'))]
+}
+
+/**
+ * The first reason one of these scrapbooks can't be bought, or null if all can: each must
+ * be purchasable (the same test as the free unlock), and none may already sit in another
+ * live payment — a second tab that charged it a moment ago.
+ */
+async function refuseScrapbooks(
+  userId: string,
+  scrapbookIds: string[],
+  db: Prisma.TransactionClient = prisma,
+): Promise<{ status: number; error: string } | null> {
+  for (const id of scrapbookIds) {
+    const purchasable = await findPurchasableScrapbook(userId, id, db)
+    if (!purchasable.ok) return { status: purchasable.status, error: purchasable.error }
+    if (await hasLivePayment(id, db)) return { status: 409, error: 'payment_in_progress' }
+  }
+  return null
+}
+
+// ── POST /payments/quote ─── what a selection would cost, promos applied ──────
+/**
+ * The price `/charge` would ask for these items, with the soft-launch promos applied
+ * (docs/PLAN-promos.md): what the cart shows before anything is charged. The pricing is
+ * `quoteOrder`, the very function `/charge` runs, so the cart's total and the order's can't
+ * drift apart — the FE keeps no copy of the rules.
+ *
+ * Display only, and nothing is written: ids aren't checked for ownership or state here
+ * (that's `/charge`'s job) — the price depends only on how many of each there are and on
+ * the caller's partner reward. Body `{ stripIds?, scrapbookIds? }`. Answers
+ * `{ grossAmount, listAmount, bogo, bundles, methods, adminFees }`; amounts are null when
+ * a scrapbook is in it and its list price isn't set.
+ *
+ * No method is chosen yet, so `grossAmount` is the items alone and `adminFees` says what
+ * each method would add on top — exactly what `/charge` on that method would ask for.
+ * `methods` is the channels switched on here, which the checkout modal offers.
+ */
+paymentsRouter.post(
+  '/quote',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const userId = req.userId as string
+    if (!quoteLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
+    const body = req.body as { stripIds?: unknown; scrapbookIds?: unknown }
+    const stripIds = readIds(body.stripIds)
+    const scrapbookIds = readIds(body.scrapbookIds)
+    if (
+      !stripIds ||
+      !scrapbookIds ||
+      stripIds.length > MAX_CHECKOUT_STRIPS ||
+      scrapbookIds.length > env.scrapbookMaxItems
+    ) {
+      res.status(400).json({ error: 'invalid_input' })
+      return
+    }
+
+    const quote = await quoteOrder(userId, stripIds.length, scrapbookIds.length, null)
+    const priced = scrapbookIds.length === 0 || env.scrapbookPriceIdr !== null
+    const subtotal = chargeTotal(quote.items)
+    res.json({
+      grossAmount: priced ? subtotal : null,
+      listAmount: priced
+        ? stripIds.length * env.stripPrintPriceIdr +
+          scrapbookIds.length * (env.scrapbookPriceIdr ?? 0)
+        : null,
+      bogo: quote.bogo,
+      bundles: quote.bundles,
+      methods: enabledPaymentMethods(),
+      adminFees: priced ? adminFeesFor(subtotal) : null,
+    })
   }),
 )
 
@@ -226,6 +493,9 @@ paymentsRouter.get(
   }),
 )
 
+/** Statuses no notification moves a payment out of. */
+const FINAL_STATUSES = ['paid', 'refunded']
+
 /**
  * Map a Midtrans `transaction_status` (+ `fraud_status`) to our Payment status.
  * `null` means "leave it as-is" (e.g. a `pending` we don't need to persist over an
@@ -244,6 +514,11 @@ function mapStatus(transactionStatus: string, fraudStatus?: string): string | nu
       return 'cancelled'
     case 'expire':
       return 'expired'
+    // A full refund made in the Midtrans dashboard on an order we never recorded as paid
+    // (the case an admin refund is for — see `Payment.refundedAt`). On a paid order it
+    // never gets this far: paid orders ignore every later notification.
+    case 'refund':
+      return 'refunded'
     case 'pending':
       return 'pending'
     default:
@@ -251,12 +526,165 @@ function mapStatus(transactionStatus: string, fraudStatus?: string): string | nu
   }
 }
 
+/**
+ * Move a payment to what Midtrans says its `transaction_status` is — unlocking what it
+ * covers on settlement, once, and mailing the receipt. Shared by the signed notification
+ * and the buyer's own check (`POST /payments/:orderId/check`), so both settle the same
+ * way. Idempotent: an unknown order, a paid or refunded one, and a replay all do nothing.
+ */
+async function applyMidtransStatus(
+  orderId: string,
+  transactionStatus: string,
+  fraudStatus?: string,
+  reportedAmount?: unknown,
+): Promise<void> {
+  const payment = await prisma.payment.findUnique({
+    where: { orderId },
+    include: {
+      strips: { select: { id: true } },
+      scrapbooks: { select: { id: true, title: true } },
+      user: { select: { email: true, emailVerifiedAt: true } },
+    },
+  })
+  if (!payment) {
+    // Unknown order — ack so Midtrans stops retrying, but do nothing.
+    logger.warn('payments.notification.unknown_order', { orderId })
+    return
+  }
+
+  // Idempotent: once paid, later notifications don't change entitlement. A refunded
+  // order is final the same way — a late settlement must not unlock what was given
+  // back, and Midtrans sends each refund twice.
+  if (payment.status === 'paid' || payment.status === 'refunded') {
+    return
+  }
+
+  const next = mapStatus(transactionStatus, fraudStatus)
+  // Every row starts `pending`, so this notification has nothing to add, and it can only
+  // do harm when it arrives late: Midtrans retries it, so one delayed past a cancel would
+  // put the order back to pending and block the buyer's next checkout until the dead QR's
+  // expiry.
+  if (next === null || next === 'pending') {
+    return
+  }
+
+  // Midtrans signs what it reports, so this should never fire. If it does, the money that
+  // moved isn't what we asked for: leave the order unsettled for a person to look at.
+  if (
+    next === 'paid' &&
+    reportedAmount !== undefined &&
+    Number(reportedAmount) !== payment.grossAmount
+  ) {
+    logger.error('payments.amount_mismatch', {
+      orderId,
+      expected: payment.grossAmount,
+      reported: String(reportedAmount).slice(0, 32),
+    })
+    return
+  }
+
+  if (next === 'paid') {
+    const now = new Date()
+    const stripIds = payment.strips.map((s) => s.id)
+    // **No gallery-cap check here, deliberately.** Midtrans has taken the money; refusing
+    // to unlock now would leave the user charged with nothing to show. Checkout already
+    // refused anything that wouldn't fit, so landing over the cap means the gallery filled
+    // between the two — rare, tolerated, and logged rather than enforced. The overflow
+    // drains itself: the next unlock is refused until the user frees a slot.
+    // No owner means they deleted their account while this was pending: there's no
+    // gallery to fit into (their strips went with them), but the money was still taken,
+    // so it settles as paid like any other — it's the record of what we received.
+    const room = payment.userId
+      ? await galleryRoomFor(payment.userId, stripIds.length)
+      : ({ ok: true } as const)
+    if (!room.ok) {
+      logger.warn('gallery.overCap', {
+        orderId,
+        userId: payment.userId,
+        used: room.used,
+        limit: room.limit,
+        settling: stripIds.length,
+      })
+    }
+    const scrapbookIds = payment.scrapbooks.map((s) => s.id)
+    // Flip the payment and unlock everything it covers in one transaction. A scrapbook
+    // under a live payment can't have been reopened or deleted (both refuse under its row
+    // lock), so it is still finished with its PDF; only account deletion removes it, and
+    // then there is nothing left to flip.
+    //
+    // The flip is conditional on the row not being paid yet, because Midtrans can deliver
+    // the same settlement twice at once and both would pass the `paid` check above. Only
+    // the one that flips it goes on to unlock and send the receipt — otherwise the payer
+    // gets two.
+    const flipped = await prisma.$transaction(async (tx) => {
+      const { count } = await tx.payment.updateMany({
+        where: { orderId, status: { notIn: FINAL_STATUSES } },
+        data: { status: 'paid', midtransStatus: transactionStatus, paidAt: now },
+      })
+      if (count === 0) return false
+      await tx.strip.updateMany({
+        where: { id: { in: stripIds } },
+        data: { paid: true, paidAt: now },
+      })
+      await tx.scrapbook.updateMany({
+        where: { id: { in: scrapbookIds } },
+        data: { paid: true, paidAt: now },
+      })
+      await applyPromosOnSettlement(tx, payment, now)
+      return true
+    })
+    if (!flipped) {
+      return
+    }
+    logger.info('payments.paid', {
+      orderId,
+      strips: stripIds.length,
+      scrapbooks: scrapbookIds.length,
+      bogo: payment.bogo,
+      bundles: payment.bundles,
+    })
+
+    // Verified addresses only, as with the password mail: an operator-typed address
+    // nobody has proven could be a typo, and this one says what someone bought. Not
+    // awaited — the money is in and the items are unlocked; mail can't undo that.
+    if (payment.user?.email && payment.user.emailVerifiedAt) {
+      void sendPaymentReceipt(payment.user.email, normalizeLang(payment.lang), {
+        orderId,
+        grossAmount: payment.grossAmount,
+        paidAt: now,
+        method: isPaymentMethod(payment.paymentType) ? payment.paymentType : null,
+        stripCount: stripIds.length,
+        scrapbookTitles: payment.scrapbooks.map((s) => s.title),
+        bogo: payment.bogo,
+        // Each bundle is one of these books with 3 of these strips; which ones doesn't
+        // matter, they're all priced alike.
+        bundled: payment.bundles,
+        adminFee: payment.adminFee,
+      })
+    }
+  } else {
+    // Conditional for the same reason as the flip above: an admin refund or a settlement
+    // can land between the read and this write, and neither may be overwritten.
+    const { count } = await prisma.payment.updateMany({
+      where: { orderId, status: { notIn: FINAL_STATUSES } },
+      data: {
+        status: next,
+        midtransStatus: transactionStatus,
+        ...(next === 'refunded' ? { refundedAt: new Date() } : {}),
+      },
+    })
+    if (count > 0) logger.info('payments.status', { orderId, status: next })
+  }
+}
+
 // ── POST /payments/midtrans/notification ─── the entitlement source of truth ──
 /**
  * Midtrans calls this on every status change. **Unauthenticated but
  * signature-verified** — anyone can POST here, but only Midtrans can produce the
- * signature. Idempotent: replays and already-settled orders are no-ops. This is the
- * only thing that flips `Strip.paid`; the client callback is never trusted.
+ * signature. Idempotent: replays and already-settled orders are no-ops. This and the
+ * buyer's check (`/:orderId/check`, which asks Midtrans itself) are the only things that
+ * flip `Strip.paid` and `Scrapbook.paid` for money, both through `applyMidtransStatus`
+ * (the free unlocks flip them only while payments are off); the client is never trusted.
  */
 paymentsRouter.post(
   '/midtrans/notification',
@@ -278,78 +706,225 @@ paymentsRouter.post(
         signature_key: signatureKey,
       })
     ) {
-      logger.warn('payments.notification.bad_signature', { orderId })
+      // `orderId` is whatever the caller sent, so its length and the rate are both capped.
+      const ip = clientIp(req, env.clientIpHeader)
+      if (badSignatureLogLimiter.allow(rateLimitKey(ip))) {
+        logger.warn('payments.notification.bad_signature', {
+          orderId: orderId.slice(0, 64),
+          ipPrefix: ipPrefix(ip),
+        })
+      }
       res.status(403).json({ error: 'invalid_signature' })
       return
     }
 
-    const payment = await prisma.payment.findUnique({
-      where: { orderId },
-      include: { strips: { select: { id: true } } },
-    })
-    if (!payment) {
-      // Unknown order — ack so Midtrans stops retrying, but do nothing.
-      logger.warn('payments.notification.unknown_order', { orderId })
-      res.status(200).json({ ok: true })
-      return
-    }
-
-    // Idempotent: once paid, later notifications don't change entitlement.
-    if (payment.status === 'paid') {
-      res.status(200).json({ ok: true })
-      return
-    }
-
-    const next = mapStatus(transactionStatus, fraudStatus)
-    if (next === null) {
-      res.status(200).json({ ok: true })
-      return
-    }
-
-    if (next === 'paid') {
-      const now = new Date()
-      const stripIds = payment.strips.map((s) => s.id)
-      // **No gallery-cap check here, deliberately.** Midtrans has taken the money; refusing
-      // to unlock now would leave the user charged with nothing to show. Checkout already
-      // refused anything that wouldn't fit, so landing over the cap means the gallery filled
-      // between the two — rare, tolerated, and logged rather than enforced. The overflow
-      // drains itself: the next unlock is refused until the user frees a slot.
-      // No owner means they deleted their account while this was pending: there's no
-      // gallery to fit into (their strips went with them), but the money was still taken,
-      // so it settles as paid like any other — it's the record of what we received.
-      const room = payment.userId
-        ? await galleryRoomFor(payment.userId, stripIds.length)
-        : ({ ok: true } as const)
-      if (!room.ok) {
-        logger.warn('gallery.overCap', {
-          orderId,
-          userId: payment.userId,
-          used: room.used,
-          limit: room.limit,
-          settling: stripIds.length,
-        })
-      }
-      // Flip the payment and unlock every strip it covers in one transaction.
-      await prisma.$transaction([
-        prisma.payment.update({
-          where: { orderId },
-          data: { status: 'paid', midtransStatus: transactionStatus, paidAt: now },
-        }),
-        prisma.strip.updateMany({
-          where: { id: { in: stripIds } },
-          data: { paid: true, paidAt: now },
-        }),
-      ])
-      logger.info('payments.paid', { orderId, strips: stripIds.length })
-    } else {
-      await prisma.payment.update({
-        where: { orderId },
-        data: { status: next, midtransStatus: transactionStatus },
-      })
-      logger.info('payments.status', { orderId, status: next })
-    }
-
+    await applyMidtransStatus(orderId, transactionStatus, fraudStatus, grossAmount)
     res.status(200).json({ ok: true })
+  }),
+)
+
+/**
+ * Ask Midtrans for an order's status and apply it (`applyMidtransStatus`). Returns false
+ * when Midtrans doesn't know the transaction at all — an answer, not a failure; any
+ * other Midtrans error is thrown.
+ */
+async function syncFromMidtrans(orderId: string): Promise<boolean> {
+  try {
+    const t = (await fetchTransactionStatus(orderId)) as Record<string, unknown>
+    const transactionStatus = typeof t.transaction_status === 'string' ? t.transaction_status : ''
+    const fraudStatus = typeof t.fraud_status === 'string' ? t.fraud_status : undefined
+    await applyMidtransStatus(orderId, transactionStatus, fraudStatus, t.gross_amount)
+    return true
+  } catch (error) {
+    if (midtransErrorStatus(error) === 404) return false
+    throw error
+  }
+}
+
+/** The sweeper ticks every 30 s; asking Midtrans only needs to happen this often. */
+const RECONCILE_EVERY_MS = 5 * 60_000
+/** How long past expiry to leave the `expire` or `settlement` notification to arrive. */
+const RECONCILE_GRACE_MS = 2 * 60_000
+/** For the rare order Midtrans gave no expiry: how old it must be before we ask. */
+const RECONCILE_NO_EXPIRY_AFTER_MS = 60 * 60_000
+/** Stop asking after this. Keeps a row Midtrans never resolves from being asked forever. */
+const RECONCILE_WINDOW_MS = 3 * 24 * 60 * 60_000
+const RECONCILE_BATCH = 50
+let lastReconcile = 0
+
+/**
+ * Settle orders whose notification never arrived. Wired into the periodic sweep.
+ *
+ * Only a notification or the buyer pressing "I've paid" moves an order, and once its QR
+ * expires the cart stops offering it. So a lost notification on a paid order would leave
+ * the buyer charged with nothing unlocked. This asks Midtrans about every order still
+ * `pending` past its expiry and applies the answer exactly as the webhook would.
+ *
+ * Safe on every instance: `applyMidtransStatus` is idempotent and unlocks once.
+ */
+export async function reconcilePendingPayments(now: Date = new Date()): Promise<number> {
+  if (!env.paymentsEnabled || now.getTime() - lastReconcile < RECONCILE_EVERY_MS) return 0
+  lastReconcile = now.getTime()
+
+  const stale = await prisma.payment.findMany({
+    where: {
+      status: 'pending',
+      createdAt: { gte: new Date(now.getTime() - RECONCILE_WINDOW_MS) },
+      OR: [
+        { expiresAt: { lt: new Date(now.getTime() - RECONCILE_GRACE_MS) } },
+        {
+          expiresAt: null,
+          createdAt: { lt: new Date(now.getTime() - RECONCILE_NO_EXPIRY_AFTER_MS) },
+        },
+      ],
+    },
+    orderBy: { createdAt: 'asc' },
+    take: RECONCILE_BATCH,
+    select: { orderId: true },
+  })
+  if (stale.length === 0) return 0
+
+  for (const { orderId } of stale) {
+    try {
+      // Unknown to Midtrans and past expiry: nothing can ever be paid against it.
+      if (!(await syncFromMidtrans(orderId))) await applyMidtransStatus(orderId, 'expire')
+    } catch (error) {
+      logger.warn('payments.reconcile.failed', { orderId, err: String(error) })
+    }
+  }
+
+  const orderIds = stale.map((row) => row.orderId)
+  const settled = await prisma.payment.findMany({
+    where: { orderId: { in: orderIds }, status: 'paid' },
+    select: { orderId: true },
+  })
+  logger.info('payments.reconcile', { checked: orderIds.length, paid: settled.length })
+  // Money arrived without its notification. Worth an alert: more than a stray one means
+  // the Notification URL or the path to it is broken.
+  if (settled.length > 0) {
+    logger.warn('payments.reconcile.lost_notification', {
+      orderIds: settled.map((row) => row.orderId),
+    })
+  }
+  return orderIds.length
+}
+
+// ── POST /payments/:orderId/check ─── "I've paid": ask Midtrans ourselves ─────
+/**
+ * The buyer says they've paid but the order still reads pending — the notification is
+ * late or lost. Ask Midtrans directly (server key, so its answer is as good as a signed
+ * notification) and apply it exactly as the webhook would: if Midtrans has the money,
+ * the order settles and unlocks now.
+ *
+ * Answers `{ payment, seen }`: the order as it now stands, and whether Midtrans knows the
+ * transaction at all. The checkout modal offers "Report a problem" only when this comes
+ * back still unpaid (user, 2026-11-02) — a report is for money Midtrans hasn't shown us.
+ */
+paymentsRouter.post(
+  '/:orderId/check',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    if (!env.paymentsEnabled) {
+      res.status(503).json({ error: 'payments_unavailable' })
+      return
+    }
+    const userId = req.userId as string
+    if (!statusCheckLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
+    const orderId = req.params.orderId as string
+    const owned = await prisma.payment.findUnique({
+      where: { orderId },
+      select: { userId: true, status: true },
+    })
+    if (!owned || owned.userId !== userId) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+
+    let seen = true
+    if (!FINAL_STATUSES.includes(owned.status)) {
+      try {
+        seen = await syncFromMidtrans(orderId)
+      } catch (error) {
+        logger.warn('payments.check.midtransFailed', { orderId, err: String(error) })
+        res.status(502).json({ error: 'midtrans_unavailable' })
+        return
+      }
+    }
+
+    const payment = await prisma.payment.findUniqueOrThrow({
+      where: { orderId },
+      select: PAYMENT_SELECT,
+    })
+    logger.info('payments.check', { userId, orderId, status: payment.status, seen })
+    res.json({ payment: serializePayment(payment), seen })
+  }),
+)
+
+// ── POST /payments/:orderId/cancel ─── the buyer gives up on this attempt ─────
+/**
+ * Cancel a pending payment now instead of waiting for its QR to expire (user,
+ * 2026-11-02) — to switch method, or because they changed their mind. The cart can
+ * then open a new one at once: only a `pending` row blocks a new charge.
+ *
+ * Midtrans decides, not us: we ask it to cancel and record its answer. It refuses to
+ * cancel money it has already taken, so a buyer who paid a moment before pressing
+ * Cancel isn't cancelled — we read Midtrans's real status instead and settle the order
+ * like any other (the unlock wins over the cancel). Answers `{ payment }` as it now
+ * stands; an order that is no longer pending is returned as it is.
+ */
+paymentsRouter.post(
+  '/:orderId/cancel',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    if (!env.paymentsEnabled) {
+      res.status(503).json({ error: 'payments_unavailable' })
+      return
+    }
+    const userId = req.userId as string
+    if (!statusCheckLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
+    const orderId = req.params.orderId as string
+    const owned = await prisma.payment.findUnique({
+      where: { orderId },
+      select: { userId: true, status: true },
+    })
+    if (!owned || owned.userId !== userId) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+
+    if (owned.status === 'pending') {
+      try {
+        await cancelTransaction(orderId)
+        await applyMidtransStatus(orderId, 'cancel')
+      } catch (cancelError) {
+        // Refused — most likely because it's already settled (or expired). Take Midtrans's
+        // word for what it is. Unknown to Midtrans means there is nothing it could take.
+        try {
+          if (!(await syncFromMidtrans(orderId))) await applyMidtransStatus(orderId, 'cancel')
+        } catch (error) {
+          logger.warn('payments.cancel.midtransFailed', {
+            orderId,
+            cancelErr: String(cancelError),
+            err: String(error),
+          })
+          res.status(502).json({ error: 'midtrans_unavailable' })
+          return
+        }
+      }
+    }
+
+    const payment = await prisma.payment.findUniqueOrThrow({
+      where: { orderId },
+      select: PAYMENT_SELECT,
+    })
+    logger.info('payments.cancel', { userId, orderId, status: payment.status })
+    res.json({ payment: serializePayment(payment) })
   }),
 )
 
@@ -387,11 +962,16 @@ paymentsRouter.get(
           status: true,
           createdAt: true,
           paidAt: true,
+          bogo: true,
+          bundles: true,
           // The ids, not a count: the client already holds every strip it owns, so it
           // renders the row's thumbnails from its own store rather than us re-deriving
           // storage URLs here. Deleting a strip drops the join row, so this is "what
           // this order bought that you still have" — which is also what the row shows.
           strips: { select: { id: true } },
+          // Unlike strips, the client keeps no store of scrapbooks to draw these from, so
+          // the order carries what its row shows: the title and the cover.
+          scrapbooks: { select: { id: true, title: true, coverKey: true } },
         },
       }),
       prisma.payment.aggregate({
@@ -407,8 +987,16 @@ paymentsRouter.get(
         currency: row.currency,
         status: row.status,
         stripIds: row.strips.map((strip) => strip.id),
+        // A removed scrapbook keeps its row (and this join), with no cover left to show.
+        scrapbooks: row.scrapbooks.map((scrapbook) => ({
+          id: scrapbook.id,
+          title: scrapbook.title,
+          coverUrl: coverUrlOf(scrapbook),
+        })),
         createdAt: row.createdAt.toISOString(),
         paidAt: row.paidAt?.toISOString() ?? null,
+        bogo: row.bogo,
+        bundled: row.bundles,
       })),
       // Never null: `_sum` is null when nothing matched, which is a zero total here.
       spent: settled._sum.grossAmount ?? 0,
@@ -436,6 +1024,10 @@ paymentsRouter.get(
   requireAuth,
   asyncRoute(async (req, res) => {
     const userId = req.userId as string
+    if (!qrLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
     const payment = await prisma.payment.findUnique({
       where: { orderId: req.params.orderId },
       select: { userId: true, qrImageUrl: true },

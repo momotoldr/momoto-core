@@ -25,8 +25,8 @@ enum Role {
 /// A registered user. `passwordHash` is null for Google-only accounts; `googleId`
 /// is null for email/password-only accounts (an account can have both once linked).
 model User {
-  id              String    @id @default(cuid())
-  username        String    @unique
+  id               String    @id @default(cuid())
+  username         String    @unique
   /// The account's **proven** address, or null. Accounts sign in with a username;
   /// this is how they get back in when the password is gone.
   ///
@@ -36,24 +36,24 @@ model User {
   /// Google sign-in (`auth/google.ts` rejects a token without `email_verified`, so
   /// Google did the proving) and `POST /admin/users`, where an operator types it and
   /// `emailVerifiedAt` is therefore left null.
-  email           String?   @unique
+  email            String?   @unique
   /// When `email` was proven. Null means the address is unproven, not absent —
   /// an admin-minted account has one and hasn't confirmed it.
   ///
   /// This gates exactly one thing: whether a password-reset link may be mailed.
   /// It does **not** gate sign-in, the booth, or checkout; an unproven address costs
   /// the user a banner, never access.
-  emailVerifiedAt DateTime?
-  passwordHash    String?
-  displayName     String
+  emailVerifiedAt  DateTime?
+  passwordHash     String?
+  displayName      String
   /// A picture hosted elsewhere. **Set by Google sign-in only** — users upload
   /// through `avatarImage` instead, so this is never an arbitrary user-supplied URL
   /// (which would load in the partner's browser and leak their IP to its host).
-  avatarUrl       String?
+  avatarUrl        String?
   /// When the uploaded avatar last changed. A plain column rather than a lookup
   /// through the relation, so serializing a user never needs the image bytes: it is
   /// both the "has an upload" flag and the cache-buster in the avatar URL.
-  avatarUpdatedAt DateTime?
+  avatarUpdatedAt  DateTime?
   /// Object-storage key for the uploaded avatar, in the **public** bucket.
   ///
   /// On the user row rather than on `AvatarImage` for one reason: `serializeUser` is
@@ -65,22 +65,42 @@ model User {
   /// Null means "no uploaded avatar in the bucket" — either the user has none at all
   /// (`avatarUpdatedAt` is null too) or theirs is a pre-storage row whose bytes are
   /// still in `avatarImage` (see that model).
-  avatarKey       String?
-  googleId        String?   @unique
+  avatarKey        String?
+  googleId         String?   @unique
   /// Privilege level. Defaults to USER; ADMIN is set only via `npm run make-admin`.
-  role            Role      @default(USER)
+  role             Role      @default(USER)
   /// Where the person lives, set only by them on their profile. Null = not given.
   /// ISO 3166-1 alpha-2; 'ID' always comes with a `regionCode`. Shown publicly only on a
   /// testimonial an admin publishes. The three columns are kept consistent by CHECK
   /// constraints in the migration, not just by `PATCH /auth/me`.
-  countryCode     String?
+  countryCode      String?
   /// Kemendagri kabupaten/kota code ("32.73"), from `src/data/regions-id.json`. Set
   /// exactly when `countryCode` is 'ID'.
-  regionCode      String?
+  regionCode       String?
   /// Free-text city abroad ("Tokyo"). Only when `countryCode` isn't 'ID'; optional.
-  cityName        String?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  cityName         String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  /// Last time the person opened the app signed in (login, register, Google, refresh),
+  /// written at most once a day by `touchActivity` (lib/activity.ts). The only input to
+  /// the inactive-account deletion (docs/PLAN-inactive-accounts.md). Existing rows were
+  /// backfilled to the migration's time, so everyone's clock started at that deploy.
+  lastActiveAt     DateTime  @default(now())
+  /// When the first inactivity warning (14 days before deletion) was mailed. Cleared by
+  /// any activity, which cancels the deletion.
+  inactiveWarnedAt DateTime?
+  /// When the final inactivity warning (3 days before) was mailed. Cleared by activity.
+  inactiveFinalAt  DateTime?
+  /// UI language at the last sign-in, so a mail sent with no request behind it (the
+  /// inactivity warning) still matches. Null = English.
+  lang             String?
+  /// Admin 6-digit codes: the shared secret, encrypted (`auth/totp.ts`). Set while setup is
+  /// in progress; only `totpEnabledAt` means it's confirmed.
+  totpSecret       String?
+  /// When TOTP was confirmed. Also versions admin sessions: changing it ends them.
+  totpEnabledAt    DateTime?
+  /// The newest 30-second step a code was accepted for, so a seen code can't be replayed.
+  totpLastStep     Int?
 
   // Partner linking — a mutual one-to-one couple link (see partner routes). When
   // linked, both users' partnerId point at each other; unlinking clears both.
@@ -94,9 +114,15 @@ model User {
   partnerInvites     PartnerInvite[]          @relation("Inviter")
   avatarImage        AvatarImage?
   strips             Strip[]
-  payments           Payment[]
+  scrapbooks         Scrapbook[]
+  payments           Payment[]                @relation("PaymentOwner")
+  refundedPayments   Payment[]                @relation("PaymentRefundedBy")
+  promoGrants        PromoGrant[]             @relation("PromoGrantOwner")
+  promoGrantsSourced PromoGrant[]             @relation("PromoGrantSource")
+  totpRecoveryCodes  TotpRecoveryCode[]
   feedbacks          Feedback[]               @relation("FeedbackAuthor")
   supportTickets     SupportTicket[]          @relation("SupportTicketAuthor")
+  supportReplies     SupportReply[]           @relation("SupportReplySentBy")
   partnerFeedbacks   Feedback[]               @relation("FeedbackPartner")
   testimonials       Testimonial[]            @relation("TestimonialAuthor")
   featuredWith       Testimonial[]            @relation("TestimonialPartner")
@@ -104,6 +130,8 @@ model User {
 
   /// Keyset order for the admin users table (newest first, id breaks ties).
   @@index([createdAt, id])
+  /// The inactive-account job walks accounts by last activity, in keyset batches.
+  @@index([lastActiveAt, id])
   /// Trigram indexes for the admin user search (`ILIKE '%q%'`), so finding one account
   /// is an index lookup instead of a full scan. Needs the pg_trgm extension (created in
   /// migration 20261010010000) and a search of 3+ characters — see admin `/users`.
@@ -188,12 +216,12 @@ model Feedback {
 /// 2026-10-10 both were rows of one table, told apart by `category`): its own ticket
 /// numbering, topic, status and reply address.
 model SupportTicket {
-  id                 String    @id @default(cuid())
+  id                 String         @id @default(cuid())
   /// Short, human-referenceable number (SUP-0005) an operator quotes back to the user.
   /// Tickets moved over from `Feedback` kept theirs; new ones continue after the highest.
-  ticketNumber       Int       @unique @default(autoincrement())
+  ticketNumber       Int            @unique @default(autoincrement())
   userId             String?
-  user               User?     @relation("SupportTicketAuthor", fields: [userId], references: [id], onDelete: SetNull)
+  user               User?          @relation("SupportTicketAuthor", fields: [userId], references: [id], onDelete: SetNull)
   /// What it's about ('session' | 'strip' | 'payment' | 'account' | 'other'), picked
   /// before the message is written. Null for requests sent before topics existed.
   topic              String?
@@ -208,11 +236,13 @@ model SupportTicket {
   userAgent          String?
   /// UI language when it was sent ('en' | 'id'), so a reply can match it.
   lang               String?
-  createdAt          DateTime  @default(now())
+  createdAt          DateTime       @default(now())
   /// When an admin marked it handled (null = still open). The acting admin is recorded
   /// in the server log, not here. 3 days after this the ticket is deleted
   /// (lib/supportRetention.ts); open tickets are kept however old.
   resolvedAt         DateTime?
+  /// Answers an admin emailed from the console, oldest first.
+  replies            SupportReply[]
 
   /// Keyset order for the admin support inbox (newest first, id breaks ties).
   @@index([createdAt, id])
@@ -221,6 +251,26 @@ model SupportTicket {
   @@index([resolvedAt, createdAt, id])
   /// A user's tickets: the admin users table count, user detail, account deletion.
   @@index([userId])
+}
+
+/// An answer to a support ticket, emailed to the ticket's address from the admin
+/// console (momoto-notify `support_reply`). Recorded only once notify accepted it, so a
+/// row means "sent" — what the customer writes back lands in the support mailbox, not
+/// here. Goes with its ticket when the ticket is deleted.
+model SupportReply {
+  id        String        @id @default(cuid())
+  ticketId  String
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  message   String
+  /// Where it went: the ticket's address at the time of sending.
+  sentTo    String
+  /// The admin who sent it; null once that account is gone.
+  sentById  String?
+  sentBy    User?         @relation("SupportReplySentBy", fields: [sentById], references: [id], onDelete: SetNull)
+  createdAt DateTime      @default(now())
+
+  @@index([ticketId, createdAt])
+  @@index([sentById])
 }
 
 /// A rating comment an admin has picked for the landing page's "What people say" section,
@@ -347,6 +397,56 @@ model Strip {
   @@index([sessionId, createdAt])
 }
 
+/// A scrapbook: a fixed template (the FE's `scrapbookTemplates.ts`) filled with the
+/// owner's unlocked strips and their own text, finished into a PDF and sold as one.
+///
+/// `content` is the layout only — `{ strips: { [slotId]: stripId }, texts: { [textId]:
+/// string } }` — never pixels: strips are referenced by id and drawn from their own
+/// objects. Slot ids belong to the template manifest, which is why this is JSON and not a
+/// join table (docs/PLAN-scrapbook.md §1).
+///
+/// Lifecycle, derived from the columns rather than stored:
+///   draft    — `finishedAt` null; editable.
+///   finished — `finishedAt` set: the browser rendered the PDF and it is stored; content
+///              is locked. Reopening (only while unpaid) deletes the PDF and clears it.
+///   paid     — final. Never changes again; Duplicate starts a new draft from it.
+/// A paid scrapbook is never hard-deleted (its `Payment` names it); removing one sets
+/// `removedAt` and deletes its objects, as a gallery strip's remove does.
+model Scrapbook {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Manifest id of the template. Free-form, not an enum: a template is a FE manifest
+  /// entry, and one scrapbook keeps the template it was started on.
+  templateId String
+  title      String    @default("")
+  content    Json
+  /// When the rendered PDF was stored. Non-null means the content is locked.
+  finishedAt DateTime?
+  /// The rendered PDF, in the **private** bucket — the paid deliverable, only ever
+  /// handed out through the owner + paid gate on `GET /scrapbooks/:id/pdf(-url)`.
+  pdfKey     String?
+  pdfBytes   Int?
+  /// Declared by the client that rendered the PDF. Informational only.
+  pageCount  Int?
+  /// Small WebP of the cover page, in the **public** bucket, for the shelf and Purchases.
+  coverKey   String?
+  /// True once a payment for it settled, or it was unlocked free while payments are dark.
+  paid       Boolean   @default(false)
+  paidAt     DateTime?
+  /// Soft remove of a paid scrapbook: objects deleted, row kept for its `Payment`.
+  removedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  /// Doubles as the content version a finish was rendered from: the upload grant carries
+  /// it, and completing refuses if it moved (`409 content_changed`).
+  updatedAt  DateTime  @updatedAt
+
+  payments Payment[]
+
+  /// The shelf: one user's scrapbooks, most recently edited first.
+  @@index([userId, updatedAt])
+}
+
 /// One photo session (a room code) with at least one saved strip — a summary of its
 /// strips, so listing and counting sessions never has to group the Strip table.
 ///
@@ -406,20 +506,35 @@ model StripPrintImage {
 /// the webhook looks a payment up by. `grossAmount` is set server-side (count ×
 /// `STRIP_PRINT_PRICE_IDR`) — never trusted from the client.
 model Payment {
-  id             String    @id @default(cuid())
+  id             String      @id @default(cuid())
   /// Our Midtrans `order_id` (unique per attempt).
-  orderId        String    @unique
+  orderId        String      @unique
   /// Null once the payer deleted their account: the payment stays as the record of money
-  /// received (there are no refunds), detached rather than deleted with them.
+  /// received (a paid order is never refunded), detached rather than deleted with them.
   userId         String?
-  user           User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  user           User?       @relation("PaymentOwner", fields: [userId], references: [id], onDelete: SetNull)
   /// The strips this checkout unlocks (implicit m-n) — all flipped paid on settlement.
   /// Empty once the payer's account is deleted (their strips go with it).
   strips         Strip[]
+  /// The scrapbooks this checkout unlocks (implicit m-n, like `strips`). One order can
+  /// hold strips and scrapbooks together (since 2026-10-17). Empty once the payer's
+  /// account is deleted (their scrapbooks go with it).
+  scrapbooks     Scrapbook[]
+  /// Priced with the partner buy 1 get 1 (docs/PLAN-promos.md §1): two of `strips` were
+  /// charged as one. The reward is spent when this settles, not when it's charged.
+  bogo           Boolean     @default(false)
+  /// The reward this payment spent, once it settled.
+  usedGrant      PromoGrant?
+  /// How many scrapbook bundles priced it (docs/PLAN-promos.md §2): each one finished
+  /// scrapbook + 3 of its unpaid strips at the bundle price, as one Midtrans line.
+  bundles        Int         @default(0)
+  /// The payment method's admin fee (`ADMIN_FEE_<METHOD>`, user 2026-11-02), whole rupiah,
+  /// already inside `grossAmount` as its own Midtrans line. 0 for none.
+  adminFee       Int         @default(0)
   grossAmount    Int
-  currency       String    @default("IDR")
-  /// pending | paid | failed | expired | cancelled
-  status         String    @default("pending")
+  currency       String      @default("IDR")
+  /// pending | paid | failed | expired | cancelled | refunded
+  status         String      @default("pending")
   /// Core API channel this order was charged on: gopay | shopeepay | qris.
   paymentType    String?
   /// Midtrans-hosted QR image (gopay, qris). Null for deeplink-only channels.
@@ -431,11 +546,27 @@ model Payment {
   expiresAt      DateTime?
   /// Raw Midtrans `transaction_status` from the last notification, for audit.
   midtransStatus String?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  /// UI language at checkout ('en' | 'id'), so the settlement receipt — sent from the
+  /// webhook, which has no request of the payer's to read it from — matches it.
+  lang           String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
   paidAt         DateTime?
+  /// Refunds are for one case only: Midtrans took the money but we never recorded it as
+  /// paid (a lost or late settlement), so nothing was unlocked. An admin refunds it from
+  /// the portal, or a refund made in the Midtrans dashboard is recorded here. A paid
+  /// order is never refunded through the app. `refunded` is final: later notifications
+  /// for this order are ignored.
+  refundedAt     DateTime?
+  /// Why the admin refunded it (shown in the payer's GoPay history too). Null when the
+  /// refund came in from the Midtrans dashboard.
+  refundReason   String?
+  /// The admin who refunded it. Null for a dashboard refund, or once that account is gone.
+  refundedById   String?
+  refundedBy     User?       @relation("PaymentRefundedBy", fields: [refundedById], references: [id], onDelete: SetNull)
 
   @@index([userId])
+  @@index([refundedById])
   /// Keyset order for the admin transactions table (newest first, id breaks ties).
   @@index([createdAt, id])
   /// The transactions table filtered by status: newest-first within one status, so a
@@ -445,6 +576,32 @@ model Payment {
   /// Admin Transactions revenue: the live sum for a range's partial first/last day
   /// (whole days come off the `revenue` DailyStat counter).
   @@index([paidAt])
+}
+
+/// A one-time promo reward on an account (docs/PLAN-promos.md §1). One row per
+/// (user, kind), ever: the unique index is what makes "once per account" hold across
+/// unlinks and relinks. Deleted with the account.
+model PromoGrant {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation("PromoGrantOwner", fields: [userId], references: [id], onDelete: Cascade)
+  /// `partner_bogo` for now. A string, so a later promo is a new kind, not a migration.
+  kind            String
+  /// The partner whose link earned it, for support and the portal. SetNull: the reward
+  /// outlives the link and the other account.
+  sourceUserId    String?
+  sourceUser      User?     @relation("PromoGrantSource", fields: [sourceUserId], references: [id], onDelete: SetNull)
+  /// `link` | `beta_backfill`
+  reason          String
+  createdAt       DateTime  @default(now())
+  /// Set when the payment that used it settles.
+  usedAt          DateTime?
+  usedByPaymentId String?   @unique
+  usedByPayment   Payment?  @relation(fields: [usedByPaymentId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, kind])
+  /// For the SetNull when the source account is deleted.
+  @@index([sourceUserId])
 }
 
 /// **Legacy** storage for an uploaded profile picture, as bytes in Postgres.
@@ -592,4 +749,38 @@ model DailyStat {
 model MetricTotal {
   metric String @id
   value  BigInt
+}
+
+/// One request against the operator surface: every `/admin/*` call by an admin, reads of
+/// personal data included, and every signed-in non-admin turned away from it. Written by
+/// `lib/adminAudit.ts`, kept a year, and never changed afterwards.
+///
+/// `actorId` is deliberately not a relation, so the record outlives the account. The query
+/// string is deliberately left out, because a search term is usually someone's name.
+model AdminAuditLog {
+  id        String   @id @default(cuid())
+  actorId   String
+  method    String
+  /// Includes the target's id, as in `/admin/users/<id>`.
+  path      String
+  status    Int
+  ipPrefix  String?
+  createdAt DateTime @default(now())
+
+  /// One operator's history, newest first.
+  @@index([actorId, createdAt])
+  /// The retention sweep, and reading the whole log by time.
+  @@index([createdAt])
+}
+
+/// A one-time code for an admin who has lost their phone. Hashed, because it is only ever
+/// compared, and shown to its owner once.
+model TotpRecoveryCode {
+  id       String    @id @default(cuid())
+  userId   String
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash String
+  usedAt   DateTime?
+
+  @@unique([userId, codeHash])
 }

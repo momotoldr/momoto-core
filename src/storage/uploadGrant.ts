@@ -7,7 +7,8 @@ import { env } from '../config/env.js'
 /**
  * The receipt a direct upload carries from its start to its completion.
  *
- * Starting an upload (`POST /strips/uploads`, `POST /auth/me/avatar/uploads`) runs the
+ * Starting an upload (`POST /strips/uploads`, `POST /auth/me/avatar/uploads`,
+ * `POST /scrapbooks/:id/finish/uploads`) runs the
  * checks, mints the `incoming/` keys and signs this; completing it hands the token back.
  * That is what stops a client completing with keys it chose itself — say, someone
  * else's upload, or an object already promoted — and what carries the strip's metadata
@@ -53,7 +54,22 @@ export interface AvatarUploadGrant {
   file: GrantedFile
 }
 
-export type UploadGrant = StripUploadGrant | AvatarUploadGrant
+export interface ScrapbookUploadGrant {
+  kind: 'scrapbook'
+  userId: string
+  scrapbookId: string
+  /**
+   * The scrapbook's `updatedAt` (ISO) when the finish started — the content the PDF was
+   * rendered from. Completing refuses if it moved, so a PDF can never be stored for
+   * content that has since changed (an autosave from another tab or device mid-upload).
+   */
+  contentVersion: string
+  pdf: GrantedFile
+  cover: GrantedFile
+  pageCount: number
+}
+
+export type UploadGrant = StripUploadGrant | AvatarUploadGrant | ScrapbookUploadGrant
 
 export function signUploadGrant(grant: UploadGrant): string {
   return jwt.sign({ grant }, signingKey, {

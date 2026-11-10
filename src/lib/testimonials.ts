@@ -61,7 +61,8 @@ export function isEligibleFeedback(f: {
  *
  * - `shown` — the author is still linked to the partner they had when they wrote it, and
  *   no admin has hidden them;
- * - `unlinked` — they've since unlinked (or the author relinked with someone else);
+ * - `unlinked` — the author is no longer linked to that partner. Links are permanent since
+ *   2026-10-29, so only a pair that unlinked before then lands here;
  * - `hidden` — still linked, but an admin took the partner off the card.
  *
  * Null when there is no partner to show (solo, or the partner's account is gone). Every
@@ -81,7 +82,7 @@ export function coupleStatus(input: {
 
 /**
  * Bumped whenever something a published card shows may have changed: any admin
- * testimonial mutation, or a partner unlink. The public endpoint's cache keys on it, so
+ * testimonial mutation, or an account deletion. The public endpoint's cache keys on it, so
  * a change is visible on the next request rather than after the cache's TTL.
  */
 let revision = 0

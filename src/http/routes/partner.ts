@@ -1,11 +1,13 @@
 import { Router } from 'express'
 
 import { serializeUser } from '../../auth/serialize.js'
+import { env } from '../../config/env.js'
 import { prisma } from '../../db/client.js'
+import { clientIp, rateLimitKey } from '../../lib/clientIp.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
-import { markTestimonialsChanged } from '../../lib/testimonials.js'
 import { generateInviteCode } from '../../lib/inviteCode.js'
+import { grantPartnerPromo } from '../../promos/promos.js'
 import { asyncRoute } from '../asyncRoute.js'
 import { requireAuth } from '../middleware/requireAuth.js'
 
@@ -15,10 +17,16 @@ export const partnerRouter = Router()
 partnerRouter.use(requireAuth)
 
 const partnerLimiter = new RateLimiter(30, 60_000)
+/**
+ * Wrong codes per address. The limit above is per account, so many throwaway accounts
+ * would multiply it, and a lucky guess links a stranger permanently. Counts misses only:
+ * someone with the right code never gets near it.
+ */
+const inviteGuessLimiter = new RateLimiter(30, 10 * 60_000)
 const INVITE_TTL_MS = 24 * 60 * 60 * 1000
 
 export function sweepPartnerLimits(now: number = Date.now()): number {
-  return partnerLimiter.sweep(now)
+  return partnerLimiter.sweep(now) + inviteGuessLimiter.sweep(now)
 }
 
 /** Deletes expired / used partner invites. Wired into the periodic sweep. */
@@ -71,8 +79,17 @@ partnerRouter.post(
       .trim()
       .toUpperCase()
 
+    // Out of guesses reads as a wrong code, so it says nothing about this one.
+    const guessKey = rateLimitKey(clientIp(req, env.clientIpHeader))
+    if (!inviteGuessLimiter.peek(guessKey)) {
+      logger.warn('partner.accept.guess_limited', { userId: req.userId })
+      res.status(400).json({ error: 'invite_invalid' })
+      return
+    }
+
     const invite = await prisma.partnerInvite.findUnique({ where: { code } })
     if (!invite || invite.usedAt || invite.expiresAt <= new Date()) {
+      inviteGuessLimiter.allow(guessKey)
       res.status(400).json({ error: 'invite_invalid' })
       return
     }
@@ -98,54 +115,39 @@ partnerRouter.post(
       return
     }
 
-    // Link both directions + consume the invite in one transaction. The invite update
-    // is conditional on it still being unused, so two people racing to accept the same
-    // code can't both link: the loser's `updateMany` matches nothing and we roll back.
-    const [, , consumed] = await prisma.$transaction([
-      prisma.user.update({ where: { id: me.id }, data: { partnerId: inviter.id } }),
-      prisma.user.update({ where: { id: inviter.id }, data: { partnerId: me.id } }),
-      prisma.partnerInvite.updateMany({
+    // Consume the invite, link both directions and grant the partner promo in one
+    // transaction. The invite update is conditional on it still being unused, so two
+    // people racing to accept the same code can't both link: the loser's `updateMany`
+    // matches nothing and nothing else is written.
+    const now = new Date()
+    const linked = await prisma.$transaction(async (tx) => {
+      const consumed = await tx.partnerInvite.updateMany({
         where: { code, usedAt: null },
-        data: { usedAt: new Date() },
-      }),
-    ])
-    if (consumed.count === 0) {
+        data: { usedAt: now },
+      })
+      if (consumed.count === 0) return null
+      await tx.user.update({ where: { id: me.id }, data: { partnerId: inviter.id } })
+      await tx.user.update({ where: { id: inviter.id }, data: { partnerId: me.id } })
+      // Promo A (docs/PLAN-promos.md §1b): both sides, once per account, one must be new.
+      return { earned: await grantPartnerPromo(tx, me, inviter, now) }
+    })
+    if (!linked) {
       res.status(400).json({ error: 'invite_invalid' })
       return
     }
     logger.info('partner.linked', { userId: me.id, partnerId: inviter.id })
+    if (linked.earned.length > 0) {
+      logger.info('promos.partnerGranted', { userIds: linked.earned, reason: 'link' })
+    }
 
     const updated = await prisma.user.findUnique({
       where: { id: me.id },
       include: { partner: true },
     })
-    res.json({ user: updated ? serializeUser(updated) : null })
-  }),
-)
-
-// ── DELETE /partner ─── unlink both accounts ───────────────────────────────────
-partnerRouter.delete(
-  '/',
-  asyncRoute(async (req, res) => {
-    const me = await prisma.user.findUnique({ where: { id: req.userId } })
-    if (!me) {
-      res.status(401).json({ error: 'unauthorized' })
-      return
-    }
-    if (me.partnerId) {
-      const partnerId = me.partnerId
-      await prisma.$transaction([
-        prisma.user.update({ where: { id: me.id }, data: { partnerId: null } }),
-        prisma.user.update({ where: { id: partnerId }, data: { partnerId: null } }),
-      ])
-      logger.info('partner.unlinked', { userId: me.id })
-      // A couple testimonial stops showing the partner the moment they unlink.
-      markTestimonialsChanged()
-    }
-    const updated = await prisma.user.findUnique({
-      where: { id: me.id },
-      include: { partner: true },
+    res.json({
+      user: updated ? serializeUser(updated) : null,
+      // So the accepter's UI can celebrate; the inviter finds out from GET /promos.
+      promo: { partnerBogo: linked.earned.includes(me.id) ? 'earned' : null },
     })
-    res.json({ user: updated ? serializeUser(updated) : null })
   }),
 )

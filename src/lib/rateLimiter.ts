@@ -36,6 +36,12 @@ export class RateLimiter {
     return entry.count < this.limit
   }
 
+  /** Give one hit back, for an attempt that was spent but never actually judged. */
+  refund(key: string): void {
+    const entry = this.hits.get(key)
+    if (entry && entry.count > 0) entry.count -= 1
+  }
+
   /** Forget a key (e.g. on socket disconnect) so it doesn't linger until sweep. */
   reset(key: string): void {
     this.hits.delete(key)

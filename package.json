@@ -13,6 +13,8 @@
     "build": "prisma generate && tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json",
+    "test": "tsx --test test/*.test.ts",
+    "test:db": "tsx --test --test-concurrency=1 test/db/*.test.ts",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -26,8 +28,9 @@
     "db:studio:staging": "node --env-file=.env.staging node_modules/prisma/build/index.js studio",
     "make-admin:staging": "node --env-file=.env.staging --import tsx scripts/makeAdmin.ts",
     "make-admin": "tsx scripts/makeAdmin.ts",
+    "admin:reset-mfa": "tsx scripts/resetAdminMfa.ts",
+    "admin:reset-mfa:staging": "node --env-file=.env.staging --import tsx scripts/resetAdminMfa.ts",
     "purge:strips": "tsx scripts/purgeStrips.ts",
-    "send:invites": "tsx scripts/sendInvites.ts",
     "backfill:strips": "tsx scripts/backfillStripStorage.ts",
     "backfill:avatars": "tsx scripts/backfillAvatarStorage.ts",
     "check:r2": "tsx scripts/checkR2.ts",
@@ -35,7 +38,9 @@
     "reset:password": "tsx scripts/resetPassword.ts",
     "backfill:emails": "tsx scripts/backfillEmails.ts",
     "check:notify": "tsx scripts/checkNotify.ts",
-    "import:regions": "tsx scripts/importRegions.ts"
+    "import:regions": "tsx scripts/importRegions.ts",
+    "promos:backfill-beta": "tsx scripts/backfillPartnerPromo.ts",
+    "promos:backfill-beta:staging": "node --env-file=.env.staging --import tsx scripts/backfillPartnerPromo.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1118.0",

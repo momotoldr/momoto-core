@@ -2,7 +2,11 @@
 // other import here, and `src/index.ts` imports it first of all for the same reason.
 import './loadEnv.js'
 
+import { createPrivateKey, createPublicKey, type KeyObject } from 'node:crypto'
+
 import { logger } from '../lib/logger.js'
+import type { PaymentMethod } from '../payments/midtrans.js'
+import type { AdminFeeRule } from '../promos/pricing.js'
 
 export interface Env {
   port: number
@@ -17,11 +21,31 @@ export interface Env {
   clientIpHeader: string | null
   // Rooms, session timing and TURN live in momoto-realtime's config, not here.
   // ── Auth ──
-  /** Signs access tokens. momoto-realtime verifies them, so its value must be identical. */
+  /**
+   * Derives the upload-grant key, and signs access tokens until `jwtKeyPair` is set.
+   * Never needs to be shared once it is.
+   */
   jwtSecret: string
+  /**
+   * Signs access tokens (ES256) when set, so that only this service can mint a login.
+   * The other services hold just the public half, and core stops accepting HS256.
+   */
+  jwtKeyPair: { privateKey: KeyObject; publicKey: KeyObject } | null
+  /** How long an admin stays in after a 6-digit code. */
+  adminSessionTtlSeconds: number
+  /** Password hashes running at once. Below the thread pool, so they can't fill it. */
+  passwordHashMaxConcurrent: number
+  /** How long a login may wait for a turn. Under the frontend's 10 s request timeout. */
+  passwordHashMaxWaitMs: number
   jwtAccessTtlSeconds: number
   jwtRefreshTtlSeconds: number
   googleClientId: string | null
+  /**
+   * Lets `POST /auth/google` redeem the authorization code the FE's custom button
+   * gets from Google's popup. Null keeps that path off (503 `google_not_configured`);
+   * an ID token, which needs no secret, is still accepted either way.
+   */
+  googleClientSecret: string | null
   cookieSecure: boolean
   /**
    * Closed-beta switch: `true` refuses self-service signup, so the only accounts that
@@ -67,16 +91,30 @@ export interface Env {
   /** Hit Midtrans production endpoints (vs sandbox). */
   midtransIsProduction: boolean
   /**
-   * Payment channels Snap may offer, in the order they appear. Empty = let Midtrans
-   * show everything the merchant account has active. Kept configurable because a
-   * channel must be activated per Midtrans environment: sandbox enables everything,
-   * production only what has been approved, so the two lists legitimately differ.
+   * Payment channels checkout offers (`enabledPaymentMethods`). `/charge` refuses any
+   * other, and the quote tells the cart which to show. Empty = every channel we support.
+   * Kept configurable because a channel must be activated per Midtrans environment —
+   * sandbox enables everything, production only what has been approved — and so one can
+   * be switched off without a release (ShopeePay, user 2026-11-02).
    */
   midtransEnabledPayments: string[]
   /** Price to unlock a strip's clean download/print, in whole rupiah. */
   stripPrintPriceIdr: number
+  /**
+   * The admin fee each payment method adds to an order (user, 2026-11-02), from
+   * `ADMIN_FEE_<METHOD>`. Null means that method charges none.
+   */
+  adminFees: Record<PaymentMethod, AdminFeeRule | null>
   /** True when PAYMENTS_ENABLED=true and both Midtrans keys are set. */
   paymentsEnabled: boolean
+  /**
+   * Whether items may be unlocked without paying: the stand-in for checkout while payments
+   * are dark. Its own switch on purpose. It used to be "payments are off", so losing the
+   * flag or either Midtrans key handed every clean copy out for free.
+   */
+  freeUnlockEnabled: boolean
+  /** Per-address backstop across the whole API, per minute. See `globalRateLimit`. */
+  apiRateLimitPerMinute: number
   /**
    * How many *unpaid* strips one user may keep at a time. Paid strips are exempt —
    * the cap limits free storage, and nothing someone bought is ever refused or
@@ -103,6 +141,65 @@ export interface Env {
    * nothing to show. Nothing already unlocked is ever auto-evicted.
    */
   galleryMaxItems: number
+  // ── Scrapbooks (docs/PLAN-scrapbook.md) ──
+  /**
+   * Price of one scrapbook, in whole rupiah, or null while it hasn't been decided.
+   *
+   * **No default on purpose.** A made-up fallback would be charged the moment payments
+   * were on; null instead makes scrapbook checkout answer `503 scrapbook_price_unset`.
+   * It deliberately doesn't refuse to boot: staging runs with payments on, and the rest
+   * of checkout (strips) must keep working while this one price is still open.
+   */
+  scrapbookPriceIdr: number | null
+  /**
+   * How many scrapbooks one user may hold at a time: drafts, finished and paid alike
+   * (removed ones don't count). Separate from both strip caps — a scrapbook never lives
+   * in the cart or the gallery. Checked at create.
+   */
+  scrapbookMaxItems: number
+  /**
+   * Ceiling on a finished scrapbook's PDF. Expected ~2 MB for flat vector art (plan
+   * §7a); this is the backstop, and what the presigned PUT signs as the most it allows.
+   */
+  scrapbookPdfMaxBytes: number
+  // ── Soft-launch promos (docs/PLAN-promos.md) ──
+  // Each promo has its own flag (user, 2026-10-27), and each flag is a total kill switch:
+  // off means no earning and no promo pricing. The FE has its own UI flag per promo.
+  /** Promo A, partner buy 1 get 1: links earn the reward and checkout spends it. */
+  partnerPromoEnabled: boolean
+  /** When links stop *earning* the reward. Rewards already earned stay usable. */
+  partnerPromoEndsAt: Date | null
+  /** How recently one of the two accounts must have been created for a link to earn it. */
+  promoNewAccountDays: number
+  /**
+   * Promo B, scrapbook bundle: one finished scrapbook + 3 unpaid strips in one checkout,
+   * at a discount (user, 2026-10-27).
+   */
+  bundlePromoEnabled: boolean
+  /**
+   * That discount, as a whole percentage off the four items' list price (user, 2026-10-27:
+   * 25%) — so it follows strip and scrapbook price changes. No default: with the flag on
+   * and this unset, the bundle counts as off (and boot logs a warning).
+   */
+  bundleDiscountPercent: number | null
+  /** When books go back to list price. */
+  bundleEndsAt: Date | null
+  // ── Inactive-account deletion (docs/PLAN-inactive-accounts.md) ──
+  /**
+   * Whether the hourly job actually warns and deletes. Off by default: the job then only
+   * logs how many accounts it *would* warn and delete (`inactive.dryrun`), so the real
+   * numbers are visible before anything is switched on.
+   */
+  inactiveDeleteEnabled: boolean
+  /** Days without activity before an account with a verified email is deleted. */
+  inactiveDeleteDays: number
+  /**
+   * Days without activity before an account with no verified email is deleted. It can't
+   * be warned, so it gets longer (user, 2026-11-03: 180).
+   */
+  inactiveDeleteSilentDays: number
+  /** Most accounts deleted per hourly run, so a first enable spreads its R2 deletes out. */
+  inactiveDeleteMaxPerRun: number
   // ── Object storage (Cloudflare R2) ──
   /** R2 connection, or null when strip bytes should stay in Postgres. */
   r2: R2Config | null
@@ -141,6 +238,17 @@ export interface R2Config {
    * bucket through `GET /avatars/:userId` instead of off the edge.
    */
   avatarPublicBaseUrl: string | null
+  /**
+   * Bucket holding everything a scrapbook stores — the finished PDFs, their covers, and
+   * the scrapbook's own `incoming/` uploads (docs/PLAN-scrapbook.md). **Private**, like
+   * the print bucket: covers reach the browser through signed URLs, never a public origin.
+   *
+   * Null when unset, which is not a boot error: scrapbook storage then answers
+   * `503 storage_unavailable` and the rest of the API is unaffected. Never defaulted to
+   * another bucket — scrapbooks were moved out of the strip buckets on purpose (user
+   * decision, 2026-10-17), and a missing variable must not quietly put them back.
+   */
+  scrapbookBucket: string | null
 }
 
 /** Connection to the notification service. */
@@ -193,6 +301,12 @@ function positiveInt(name: string, raw: string | undefined, fallback: number): n
   return n
 }
 
+/** Like `positiveInt`, but unset means null rather than a fallback. */
+function optionalPositiveInt(name: string, raw: string | undefined): number | null {
+  if (raw === undefined || raw.trim() === '') return null
+  return positiveInt(name, raw, 0)
+}
+
 function nonNegativeInt(name: string, raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw.trim() === '') return fallback
   const n = Number(raw)
@@ -202,6 +316,51 @@ function nonNegativeInt(name: string, raw: string | undefined, fallback: number)
   return n
 }
 
+/** An optional whole percentage, 1–99. Unset means null; anything else refuses to boot. */
+function optionalPercent(name: string, raw: string | undefined): number | null {
+  const n = optionalPositiveInt(name, raw)
+  if (n !== null && n >= 100) {
+    throw new Error(`Invalid ${name}: "${raw}" (expected a whole percentage from 1 to 99)`)
+  }
+  return n
+}
+
+/**
+ * One payment method's admin fee: `1000` (flat rupiah), `0.7%` (of the order after
+ * promos, up to two decimals), or both as `1000+0.7%`. Unset or `0` means no fee;
+ * anything else refuses to boot.
+ */
+function optionalAdminFee(name: string, raw: string | undefined): AdminFeeRule | null {
+  if (raw === undefined || raw.trim() === '') return null
+  const rule: AdminFeeRule = { flat: 0, basisPoints: 0 }
+  const seen = new Set<string>()
+  for (const part of raw.split('+').map((p) => p.trim())) {
+    const percent = /^(\d{1,2}(?:\.\d{1,2})?)%$/.exec(part)
+    const kind = percent ? 'percent' : /^\d+$/.test(part) ? 'flat' : null
+    if (!kind || seen.has(kind)) {
+      throw new Error(
+        `Invalid ${name}: "${raw}" (expected rupiah, a percentage, or both — 1000, 0.7%, 1000+0.7%)`,
+      )
+    }
+    seen.add(kind)
+    if (percent) rule.basisPoints = Math.round(Number(percent[1]) * 100)
+    else rule.flat = Number(part)
+  }
+  return rule.flat === 0 && rule.basisPoints === 0 ? null : rule
+}
+
+/** An optional ISO date-time. Unset means null; anything unparseable refuses to boot. */
+function optionalDate(name: string, raw: string | undefined): Date | null {
+  if (raw === undefined || raw.trim() === '') return null
+  const date = new Date(raw.trim())
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(
+      `Invalid ${name}: "${raw}" (expected an ISO date-time, e.g. 2026-11-30T23:59:59+07:00)`,
+    )
+  }
+  return date
+}
+
 /** Require a non-empty secret from the environment (never hardcode secrets). */
 function requiredSecret(name: string, raw: string | undefined): string {
   const value = raw?.trim()
@@ -209,6 +368,30 @@ function requiredSecret(name: string, raw: string | undefined): string {
     throw new Error(`Missing ${name}: set it in the environment (see .env.example).`)
   }
   return value
+}
+
+/**
+ * The P-256 signing key from `JWT_PRIVATE_KEY`, or null while the service still signs with
+ * HS256. A PEM (real or `\n`-escaped newlines) or the same PEM in base64, which is the
+ * easiest form to paste into a platform's variables. A key we can't use stops the boot,
+ * and the message never repeats the value.
+ */
+function parseJwtKeyPair(raw: string | undefined): Env['jwtKeyPair'] {
+  const value = raw?.trim()
+  if (!value) return null
+  const pem = value.includes('-----BEGIN')
+    ? value.replace(/\\n/g, '\n')
+    : Buffer.from(value, 'base64').toString('utf8')
+  let privateKey: KeyObject
+  try {
+    privateKey = createPrivateKey(pem)
+  } catch {
+    throw new Error('Invalid JWT_PRIVATE_KEY: not a readable private key.')
+  }
+  if (privateKey.asymmetricKeyDetails?.namedCurve !== 'prime256v1') {
+    throw new Error('Invalid JWT_PRIVATE_KEY: expected an EC key on the P-256 curve.')
+  }
+  return { privateKey, publicKey: createPublicKey(privateKey) }
 }
 
 /**
@@ -255,6 +438,15 @@ function parseR2(): R2Config | null {
     throw new Error('R2_AVATAR_BUCKET must not be R2_PRINT_BUCKET: avatars are public.')
   }
 
+  const scrapbookBucket = process.env.R2_SCRAPBOOK_BUCKET?.trim() || null
+  // Its own bucket or nothing: sharing one would mix scrapbook objects (and its
+  // `incoming/` lifecycle rule) back into a strip or avatar bucket.
+  if (scrapbookBucket && [bucket, printBucket || bucket, avatarBucket].includes(scrapbookBucket)) {
+    throw new Error(
+      'R2_SCRAPBOOK_BUCKET must be its own bucket, not R2_BUCKET, R2_PRINT_BUCKET or R2_AVATAR_BUCKET.',
+    )
+  }
+
   return {
     endpoint: process.env.R2_ENDPOINT?.trim() || `https://${accountId}.r2.cloudflarestorage.com`,
     accessKeyId: requiredSecret('R2_ACCESS_KEY_ID', process.env.R2_ACCESS_KEY_ID),
@@ -264,6 +456,7 @@ function parseR2(): R2Config | null {
     avatarBucket,
     publicBaseUrl,
     avatarPublicBaseUrl,
+    scrapbookBucket,
   }
 }
 
@@ -362,10 +555,27 @@ export const env: Env = {
   trustProxy: nonNegativeInt('TRUST_PROXY', process.env.TRUST_PROXY, 1),
   clientIpHeader: process.env.CLIENT_IP_HEADER?.trim().toLowerCase() || null,
   jwtSecret: requiredSecret('JWT_SECRET', process.env.JWT_SECRET),
+  jwtKeyPair: parseJwtKeyPair(process.env.JWT_PRIVATE_KEY),
+  adminSessionTtlSeconds: positiveInt('ADMIN_SESSION_TTL', process.env.ADMIN_SESSION_TTL, 28_800),
+  passwordHashMaxConcurrent: positiveInt(
+    'PASSWORD_HASH_MAX_CONCURRENT',
+    process.env.PASSWORD_HASH_MAX_CONCURRENT,
+    3,
+  ),
+  passwordHashMaxWaitMs: positiveInt(
+    'PASSWORD_HASH_MAX_WAIT_MS',
+    process.env.PASSWORD_HASH_MAX_WAIT_MS,
+    8_000,
+  ),
   jwtAccessTtlSeconds: positiveInt('JWT_ACCESS_TTL', process.env.JWT_ACCESS_TTL, 3600),
   jwtRefreshTtlSeconds: positiveInt('JWT_REFRESH_TTL', process.env.JWT_REFRESH_TTL, 604_800),
   googleClientId: process.env.GOOGLE_CLIENT_ID?.trim() || null,
-  cookieSecure: process.env.COOKIE_SECURE?.trim() === 'true',
+  googleClientSecret: process.env.GOOGLE_CLIENT_SECRET?.trim() || null,
+  // On in production unless explicitly turned off, so a missing variable can't send the
+  // refresh token over plain HTTP.
+  cookieSecure: process.env.COOKIE_SECURE
+    ? process.env.COOKIE_SECURE.trim() === 'true'
+    : process.env.NODE_ENV === 'production',
   inviteOnly: process.env.INVITE_ONLY?.trim() === 'true',
   notify: parseNotify(),
   appBaseUrl: parseAppBaseUrl(corsOrigins),
@@ -382,17 +592,80 @@ export const env: Env = {
   midtransServerKey: process.env.MIDTRANS_SERVER_KEY?.trim() || null,
   midtransClientKey: process.env.MIDTRANS_CLIENT_KEY?.trim() || null,
   midtransIsProduction: process.env.MIDTRANS_IS_PRODUCTION?.trim() === 'true',
-  // Defaults to the three QR/e-wallet channels — no cards, no VA, no convenience store.
-  midtransEnabledPayments: parseCsv(
-    process.env.MIDTRANS_ENABLED_PAYMENTS ?? 'gopay,shopeepay,qris',
-  ),
+  // ShopeePay is off by default until it's switched back on (user, 2026-11-02).
+  midtransEnabledPayments: parseCsv(process.env.MIDTRANS_ENABLED_PAYMENTS ?? 'gopay,qris'),
   // Whole rupiah (IDR has no minor unit). Default Rp8.999 per strip.
   stripPrintPriceIdr: positiveInt('STRIP_PRINT_PRICE_IDR', process.env.STRIP_PRINT_PRICE_IDR, 8999),
+  adminFees: {
+    gopay: optionalAdminFee('ADMIN_FEE_GOPAY', process.env.ADMIN_FEE_GOPAY),
+    shopeepay: optionalAdminFee('ADMIN_FEE_SHOPEEPAY', process.env.ADMIN_FEE_SHOPEEPAY),
+    qris: optionalAdminFee('ADMIN_FEE_QRIS', process.env.ADMIN_FEE_QRIS),
+  },
   // Explicit flag plus both Midtrans keys — so checkout can stay off even if keys exist.
   paymentsEnabled:
     process.env.PAYMENTS_ENABLED?.trim() === 'true' &&
     Boolean(process.env.MIDTRANS_SERVER_KEY?.trim() && process.env.MIDTRANS_CLIENT_KEY?.trim()),
+  freeUnlockEnabled: process.env.FREE_UNLOCK_ENABLED?.trim() === 'true',
+  apiRateLimitPerMinute: positiveInt(
+    'API_RATE_LIMIT_PER_MINUTE',
+    process.env.API_RATE_LIMIT_PER_MINUTE,
+    1200,
+  ),
   stripMaxItems: positiveInt('STRIP_MAX_ITEMS', process.env.STRIP_MAX_ITEMS, 5),
   galleryMaxItems: positiveInt('GALLERY_MAX_ITEMS', process.env.GALLERY_MAX_ITEMS, 25),
+  scrapbookPriceIdr: optionalPositiveInt('SCRAPBOOK_PRICE_IDR', process.env.SCRAPBOOK_PRICE_IDR),
+  scrapbookMaxItems: positiveInt('SCRAPBOOK_MAX_ITEMS', process.env.SCRAPBOOK_MAX_ITEMS, 5),
+  scrapbookPdfMaxBytes: positiveInt(
+    'SCRAPBOOK_PDF_MAX_BYTES',
+    process.env.SCRAPBOOK_PDF_MAX_BYTES,
+    12 * 1024 * 1024,
+  ),
+  partnerPromoEnabled: process.env.PARTNER_PROMO_ENABLED?.trim() === 'true',
+  partnerPromoEndsAt: optionalDate('PARTNER_PROMO_ENDS_AT', process.env.PARTNER_PROMO_ENDS_AT),
+  promoNewAccountDays: positiveInt('PROMO_NEW_ACCOUNT_DAYS', process.env.PROMO_NEW_ACCOUNT_DAYS, 7),
+  bundlePromoEnabled: process.env.BUNDLE_PROMO_ENABLED?.trim() === 'true',
+  bundleDiscountPercent: optionalPercent(
+    'BUNDLE_DISCOUNT_PERCENT',
+    process.env.BUNDLE_DISCOUNT_PERCENT,
+  ),
+  bundleEndsAt: optionalDate('BUNDLE_ENDS_AT', process.env.BUNDLE_ENDS_AT),
+  inactiveDeleteEnabled: process.env.INACTIVE_DELETE_ENABLED?.trim() === 'true',
+  inactiveDeleteDays: positiveInt('INACTIVE_DELETE_DAYS', process.env.INACTIVE_DELETE_DAYS, 90),
+  inactiveDeleteSilentDays: positiveInt(
+    'INACTIVE_DELETE_SILENT_DAYS',
+    process.env.INACTIVE_DELETE_SILENT_DAYS,
+    180,
+  ),
+  inactiveDeleteMaxPerRun: positiveInt(
+    'INACTIVE_DELETE_MAX_PER_RUN',
+    process.env.INACTIVE_DELETE_MAX_PER_RUN,
+    200,
+  ),
   r2: parseR2(),
+}
+
+// Selling and giving away the same thing can't both be on.
+if (env.freeUnlockEnabled && process.env.PAYMENTS_ENABLED?.trim() === 'true') {
+  throw new Error('FREE_UNLOCK_ENABLED and PAYMENTS_ENABLED cannot both be true.')
+}
+// Checkout answers 503 and nothing unlocks, which is safe but silent without this.
+if (process.env.PAYMENTS_ENABLED?.trim() === 'true' && !env.paymentsEnabled) {
+  logger.error('payments.misconfigured', {
+    msg: 'PAYMENTS_ENABLED is on but a Midtrans key is missing; checkout is unavailable.',
+  })
+}
+
+// The first warning goes 14 days before deletion (lib/inactiveAccounts.ts), so a shorter
+// window would warn people who were active the same day. Refuse to boot rather than
+// guess which setting was meant.
+if (env.inactiveDeleteDays <= 14) {
+  throw new Error(`INACTIVE_DELETE_DAYS must be more than 14 (got ${env.inactiveDeleteDays}).`)
+}
+
+// A warning, not a boot refusal — the same posture as SCRAPBOOK_PRICE_IDR: the rest of
+// checkout must keep working while one promo's price is missing.
+if (env.bundlePromoEnabled && env.bundleDiscountPercent === null) {
+  logger.warn('promos.bundlePriceUnset', {
+    msg: 'BUNDLE_PROMO_ENABLED is on but BUNDLE_DISCOUNT_PERCENT is unset; the bundle stays off.',
+  })
 }

@@ -36,10 +36,14 @@ const STRIP_MAX_BYTES = 8 * 1024 * 1024
 
 /** Uploads store real bytes — keep the rate modest (per user). */
 const stripLimiter = new RateLimiter(30, 10 * 60_000)
+/** Completing reads each file back and decodes it, so it can't be free to repeat. */
+const stripCompleteLimiter = new RateLimiter(60, 10 * 60_000)
+/** Clean copies can stream through this server. Roomy enough to fetch a whole gallery. */
+const downloadLimiter = new RateLimiter(120, 10 * 60_000)
 
 /** Reclaim expired strip-upload rate windows (wired into the periodic sweep). */
 export function sweepStripLimits(now: number = Date.now()): number {
-  return stripLimiter.sweep(now)
+  return stripLimiter.sweep(now) + stripCompleteLimiter.sweep(now) + downloadLimiter.sweep(now)
 }
 
 /**
@@ -254,7 +258,7 @@ export const stripSummarySelect = {
  * stays the relative `/strips/:id`, which the client resolves against the API base and
  * this server proxies from the bucket — so the contract is "a URL" either way.
  */
-function serializeStrip(strip: SerializableStrip) {
+export function serializeStrip(strip: SerializableStrip) {
   const cdn = strip.storageKey ? publicUrl('public', strip.storageKey) : null
   // Absolute when served from the CDN; otherwise relative to this API's origin,
   // and the client prefixes it with the API base URL.
@@ -292,14 +296,15 @@ function serializeStrip(strip: SerializableStrip) {
  * Counted in memory rather than with two `prisma.count` queries: the listing loads every
  * one of the user's strips anyway, so the meter is free here and a round trip there.
  *
- * The two buckets are independent on purpose. `cart` counts unpaid strips (what
- * `POST /strips` refuses at), `gallery` counts paid ones (what an unlock refuses at) —
- * a full gallery must never stop someone saving a new capture.
+ * The two buckets are independent on purpose. `cart` counts unpaid strips plus the
+ * finished scrapbooks waiting there (what `POST /strips` and a scrapbook finish refuse
+ * at), `gallery` counts paid strips (what an unlock refuses at) — a full gallery must
+ * never stop someone saving a new capture.
  */
-function quotaFor(strips: { paid: boolean }[]) {
+function quotaFor(strips: { paid: boolean }[], scrapbooks: number) {
   const galleryUsed = strips.reduce((total, strip) => total + (strip.paid ? 1 : 0), 0)
   return {
-    cart: { used: strips.length - galleryUsed, limit: env.stripMaxItems },
+    cart: { used: strips.length - galleryUsed + scrapbooks, limit: env.stripMaxItems },
     gallery: { used: galleryUsed, limit: env.galleryMaxItems },
   }
 }
@@ -331,7 +336,7 @@ async function storeImage(
  * just isn't presently able to accept strips. The rest of the API (auth, rooms) still
  * works, which is why this isn't a refuse-to-boot check.
  */
-function requireStorage(res: Response): boolean {
+export function requireStorage(res: Response): boolean {
   if (storageEnabled) return true
   logger.error('strips.storageUnavailable', {
     msg: 'Object storage is not configured; strips cannot be saved. Set R2_ACCOUNT_ID etc.',
@@ -393,7 +398,7 @@ async function acceptableThumbnail(bytes: Buffer | null): Promise<Buffer | null>
  * buffering) matters here: these are multi-megabyte PNGs, and holding each one whole
  * in the heap is what made concurrent loads slow on a small instance.
  */
-async function serveImage(res: Response, bucket: Bucket, key: string): Promise<boolean> {
+export async function serveImage(res: Response, bucket: Bucket, key: string): Promise<boolean> {
   const stream = await getImageStream(bucket, key)
   if (!stream) return false
   stream.pipe(res)
@@ -573,17 +578,32 @@ async function answerReplay(res: Response, userId: string, clientKey: string | n
 }
 
 /**
- * Whether the cart is already at its cap.
+ * Finished, unpaid scrapbooks. They wait in the cart to be paid for, and each takes one
+ * of its slots like a strip (user decision, 2026-10-17). A draft isn't in the cart yet; a
+ * paid one has left it.
+ */
+export function scrapbooksInCart(userId: string): Promise<number> {
+  return prisma.scrapbook.count({
+    where: { userId, removedAt: null, paid: false, finishedAt: { not: null } },
+  })
+}
+
+/**
+ * Whether the cart is already at its cap (`STRIP_MAX_ITEMS`, which caps the whole cart:
+ * unpaid strips and finished scrapbooks together).
  *
  * Checked *before* anything is written to a bucket: rejecting after the upload would
- * leave objects in R2 that no row names. Only unpaid strips count — a strip someone paid
+ * leave objects in R2 that no row names. Only unpaid items count — a strip someone paid
  * for is theirs to keep, and shouldn't stop them making another. Two tabs racing can land
  * at cap + 1; that's accepted rather than paying for a serializable transaction.
  */
-async function cartIsFull(userId: string): Promise<boolean> {
-  const unpaid = await prisma.strip.count({ where: { userId, paid: false } })
-  if (unpaid < env.stripMaxItems) return false
-  logger.info('strips.cartFull', { userId, unpaid, limit: env.stripMaxItems })
+export async function cartIsFull(userId: string): Promise<boolean> {
+  const [strips, scrapbooks] = await Promise.all([
+    prisma.strip.count({ where: { userId, paid: false } }),
+    scrapbooksInCart(userId),
+  ])
+  if (strips + scrapbooks < env.stripMaxItems) return false
+  logger.info('strips.cartFull', { userId, strips, scrapbooks, limit: env.stripMaxItems })
   return true
 }
 
@@ -765,7 +785,7 @@ stripsRouter.post(
  * One file the client intends to upload, as it declared it. The declared size is signed
  * into the PUT URL, so R2 enforces the bound checked here.
  */
-function readDeclaredFile(
+export function readDeclaredFile(
   value: unknown,
   types: readonly string[],
   maxBytes: number,
@@ -893,6 +913,10 @@ stripsRouter.post(
   asyncRoute(async (req, res) => {
     const userId = req.userId as string
     if (!requireStorage(res)) return
+    if (!stripCompleteLimiter.allow(userId)) {
+      res.status(429).json({ error: 'too_many_requests' })
+      return
+    }
     const grant = verifyUploadGrant(
       (req.body as { token?: unknown } | undefined)?.token,
       'strip',
@@ -1132,7 +1156,7 @@ stripsRouter.post(
   '/unlock',
   requireAuth,
   asyncRoute(async (req, res) => {
-    if (env.paymentsEnabled) {
+    if (!env.freeUnlockEnabled) {
       res.status(403).json({ error: 'payments_enabled' })
       return
     }
@@ -1192,11 +1216,14 @@ export function sweepRemoveLimits(now: number = Date.now()): number {
 
 /** The user's live strips' quota, for a response that has just changed it. */
 async function currentQuota(userId: string) {
-  const strips = await prisma.strip.findMany({
-    where: { userId, removedAt: null },
-    select: { paid: true },
-  })
-  return quotaFor(strips)
+  const [strips, scrapbooks] = await Promise.all([
+    prisma.strip.findMany({
+      where: { userId, removedAt: null },
+      select: { paid: true },
+    }),
+    scrapbooksInCart(userId),
+  ])
+  return quotaFor(strips, scrapbooks)
 }
 
 // ── POST /strips/:id/remove ─── take an unlocked strip out of the gallery ────
@@ -1280,17 +1307,20 @@ stripsRouter.get(
   requireAuth,
   asyncRoute(async (req, res) => {
     const userId = req.userId as string
-    const strips = await prisma.strip.findMany({
-      // Removed strips have no images left to show, and the client never needs them:
-      // the purchase history still names them through the payment, and draws a
-      // placeholder for an id the cart doesn't hold.
-      where: { userId, removedAt: null },
-      orderBy: { createdAt: 'desc' },
-      // Never load the bytes for a listing — the metadata + image URL is all the cart
-      // needs, and the bytes are large.
-      select: stripSummarySelect,
-    })
-    res.json({ strips: strips.map(serializeStrip), quota: quotaFor(strips) })
+    const [strips, scrapbooks] = await Promise.all([
+      prisma.strip.findMany({
+        // Removed strips have no images left to show, and the client never needs them:
+        // the purchase history still names them through the payment, and draws a
+        // placeholder for an id the cart doesn't hold.
+        where: { userId, removedAt: null },
+        orderBy: { createdAt: 'desc' },
+        // Never load the bytes for a listing — the metadata + image URL is all the cart
+        // needs, and the bytes are large.
+        select: stripSummarySelect,
+      }),
+      scrapbooksInCart(userId),
+    ])
+    res.json({ strips: strips.map(serializeStrip), quota: quotaFor(strips, scrapbooks) })
   }),
 )
 
@@ -1413,13 +1443,17 @@ interface CleanCopy {
  * Decide whether the caller may have this strip's clean copy, and answer for them if not.
  *
  * Shared by both ways of handing it over (`/print` streams it, `/print-url` signs a URL
- * for it), so they can never drift apart on who gets the file: owner only, paid when
- * `env.paymentsEnabled`, and a 404 for anything that doesn't resolve. Returns null once
+ * for it), so they can never drift apart on who gets the file: owner only, paid unless
+ * `env.freeUnlockEnabled`, and a 404 for anything that doesn't resolve. Returns null once
  * it has responded.
  */
 async function authorizeCleanCopy(req: Request, res: Response): Promise<CleanCopy | null> {
   const userId = req.userId as string
   const id = req.params.id as string
+  if (!downloadLimiter.allow(userId)) {
+    res.status(429).json({ error: 'too_many_requests' })
+    return null
+  }
   const strip = await prisma.strip.findUnique({
     where: { id },
     // Ownership and the paid gate are decided on metadata alone — the image is
@@ -1434,7 +1468,7 @@ async function authorizeCleanCopy(req: Request, res: Response): Promise<CleanCop
     res.status(404).json({ error: 'not_found' })
     return null
   }
-  if (env.paymentsEnabled && !strip.paid) {
+  if (!strip.paid && !env.freeUnlockEnabled) {
     res.status(402).json({ error: 'payment_required' })
     return null
   }

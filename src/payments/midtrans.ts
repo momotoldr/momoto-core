@@ -1,9 +1,9 @@
-import { createHash } from 'node:crypto'
+import { createHash, timingSafeEqual } from 'node:crypto'
 
 // midtrans-client is CommonJS and its named exports aren't visible to Node's ESM
 // lexer, so import the default and destructure the classes at runtime; the type
 // names come from the ambient declaration via `import type`.
-import type { CoreApi as CoreApiType } from 'midtrans-client'
+import type { CoreApi as CoreApiType, MidtransError } from 'midtrans-client'
 import midtransClient from 'midtrans-client'
 
 import { env } from '../config/env.js'
@@ -22,13 +22,23 @@ const { CoreApi } = midtransClient
  */
 let core: CoreApiType | null = null
 
+/**
+ * How long one Midtrans call may take. The library sets no timeout, so a hung connection
+ * would hold a request open indefinitely. Kept under the frontend's 10 s request timeout,
+ * so the buyer gets our answer rather than giving up and retrying into a second charge.
+ */
+const MIDTRANS_TIMEOUT_MS = 8_000
+
 function getCore(): CoreApiType {
-  core ??= new CoreApi({
-    // Non-null: callers gate on `env.paymentsEnabled` before reaching here.
-    isProduction: env.midtransIsProduction,
-    serverKey: env.midtransServerKey as string,
-    clientKey: env.midtransClientKey as string,
-  })
+  if (!core) {
+    core = new CoreApi({
+      // Non-null: callers gate on `env.paymentsEnabled` before reaching here.
+      isProduction: env.midtransIsProduction,
+      serverKey: env.midtransServerKey as string,
+      clientKey: env.midtransClientKey as string,
+    })
+    core.httpClient.http_client.defaults.timeout = MIDTRANS_TIMEOUT_MS
+  }
   return core
 }
 
@@ -40,13 +50,31 @@ export function isPaymentMethod(value: unknown): value is PaymentMethod {
   return typeof value === 'string' && (PAYMENT_METHODS as readonly string[]).includes(value)
 }
 
+/**
+ * The channels switched on in this environment (`MIDTRANS_ENABLED_PAYMENTS`), in our
+ * order. A name we don't support is ignored; an empty list means all of them.
+ */
+export function enabledPaymentMethods(): PaymentMethod[] {
+  const on = env.midtransEnabledPayments
+  return PAYMENT_METHODS.filter((method) => on.length === 0 || on.includes(method))
+}
+
+/** One line on the Midtrans receipt: strips at their price, scrapbooks at theirs. */
+export interface ChargeItem {
+  /** The line item's id: `strip-print` or `scrapbook`. */
+  id: string
+  name: string
+  /** Price per item, in whole rupiah. */
+  price: number
+  quantity: number
+}
+
 export interface ChargeOrder {
   orderId: string
-  /** Price per strip, in whole rupiah. */
-  unitPrice: number
-  /** How many strips this checkout unlocks. */
-  quantity: number
-  itemName: string
+  /** At least one line; empty lines (quantity 0) are left off. */
+  items: ChargeItem[]
+  /** App path a wallet returns the buyer to (ShopeePay's `callback_url`): the cart. */
+  returnPath: string
   customer: { name: string; email: string | null }
   method: PaymentMethod
 }
@@ -90,35 +118,43 @@ function actionUrl(actions: unknown, name: string): string | null {
 }
 
 /** Per-channel charge parameters. Shared fields are merged in by `chargeTransaction`. */
-function channelParams(method: PaymentMethod): Record<string, unknown> {
+function channelParams(method: PaymentMethod, returnPath: string): Record<string, unknown> {
   switch (method) {
     case 'gopay':
       // `enable_callback` off: we own the return journey, and the notification — not the
       // browser coming back — is what settles the order.
       return { gopay: { enable_callback: false } }
     case 'shopeepay':
-      return { shopeepay: { callback_url: `${env.appBaseUrl}/cart` } }
+      return { shopeepay: { callback_url: `${env.appBaseUrl}${returnPath}` } }
     case 'qris':
       // GoPay as acquirer; the QR is still QRIS, scannable by any Indonesian wallet.
       return { qris: { acquirer: 'gopay' } }
   }
 }
 
+/** What a set of lines adds up to — the order's `gross_amount`. */
+export function chargeTotal(items: ChargeItem[]): number {
+  return items.reduce((total, item) => total + item.price * item.quantity, 0)
+}
+
 /** Open a transaction on one channel and return what the client needs to render. */
 export async function chargeTransaction(order: ChargeOrder): Promise<ChargeResult> {
-  // gross_amount must equal Σ(price × quantity); one line item, quantity = #strips.
-  const grossAmount = order.unitPrice * order.quantity
+  // gross_amount must equal Σ(price × quantity) over the lines, or Midtrans refuses it.
+  const items = order.items.filter((item) => item.quantity > 0)
   const response = (await getCore().charge({
     payment_type: order.method,
-    transaction_details: { order_id: order.orderId, gross_amount: grossAmount },
-    item_details: [
-      { id: 'strip-print', price: order.unitPrice, quantity: order.quantity, name: order.itemName },
-    ],
+    transaction_details: { order_id: order.orderId, gross_amount: chargeTotal(items) },
+    item_details: items.map((item) => ({
+      id: item.id,
+      price: item.price,
+      quantity: item.quantity,
+      name: item.name,
+    })),
     customer_details: {
       first_name: order.customer.name,
       ...(order.customer.email ? { email: order.customer.email } : {}),
     },
-    ...channelParams(order.method),
+    ...channelParams(order.method, order.returnPath),
   })) as Record<string, unknown>
 
   return {
@@ -141,18 +177,57 @@ export function verifyNotificationSignature(payload: {
   gross_amount: string
   signature_key: string
 }): boolean {
-  const expected = createHash('sha512')
-    .update(
-      payload.order_id +
-        payload.status_code +
-        payload.gross_amount +
-        (env.midtransServerKey as string),
-    )
-    .digest('hex')
-  return expected === payload.signature_key
+  // The route is reachable with payments off. Without a key the hash below would be over
+  // the text "null", which anyone can compute.
+  if (!env.midtransServerKey) return false
+  const expected = Buffer.from(
+    createHash('sha512')
+      .update(payload.order_id + payload.status_code + payload.gross_amount + env.midtransServerKey)
+      .digest('hex'),
+  )
+  const presented = Buffer.from(payload.signature_key)
+  return presented.length === expected.length && timingSafeEqual(presented, expected)
+}
+
+/**
+ * Cancel a transaction that was opened but will never be recorded — its QR was never shown
+ * to anyone (see the scrapbook branch of `/payments/charge`). Best-effort: a failure is
+ * logged by the caller, and an unpaid QR expires on its own anyway.
+ */
+export async function cancelTransaction(orderId: string): Promise<void> {
+  await getCore().transaction.cancel(orderId)
 }
 
 /** Re-query a transaction's authoritative status straight from Midtrans. */
 export async function fetchTransactionStatus(orderId: string) {
   return getCore().transaction.status(orderId)
+}
+
+/**
+ * Refund a settled transaction in full, back to the wallet it was paid from. Midtrans
+ * only refunds `settlement`; the caller checks that first. `refundKey` makes a retry of
+ * the same refund safe: Midtrans refuses a second refund under it rather than paying
+ * twice. `reason` shows in the payer's GoPay history.
+ */
+export async function refundTransaction(
+  orderId: string,
+  params: { refundKey: string; reason: string },
+): Promise<void> {
+  await getCore().transaction.refund(orderId, {
+    refund_key: params.refundKey,
+    reason: params.reason,
+  })
+}
+
+/** The HTTP status a failed Midtrans call carried, or null if it never got an answer. */
+export function midtransErrorStatus(error: unknown): number | null {
+  const code = (error as Partial<MidtransError> | null)?.httpStatusCode
+  const n = typeof code === 'string' ? Number(code) : code
+  return typeof n === 'number' && Number.isFinite(n) ? n : null
+}
+
+/** Midtrans's own explanation of a failed call, for the operator, if it sent one. */
+export function midtransErrorMessage(error: unknown): string | null {
+  const message = (error as Partial<MidtransError> | null)?.ApiResponse?.status_message
+  return typeof message === 'string' && message ? message : null
 }

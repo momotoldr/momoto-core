@@ -7,6 +7,7 @@
  * no `passwordHash`, no `tokenHash`, no strip/avatar image bytes. Everything here
  * operates on already-`select`ed shapes, so the bytes are never even loaded.
  */
+import { inactivitySchedule, type InactivitySchedule } from '../../lib/inactiveAccounts.js'
 import { placeLabel } from '../../lib/locations.js'
 import { coupleStatus, isEligibleFeedback } from '../../lib/testimonials.js'
 import { publicUrl } from '../../storage/objectStore.js'
@@ -56,6 +57,10 @@ export interface AdminUserRowInput {
   cityName: string | null
   createdAt: Date
   updatedAt: Date
+  emailVerifiedAt: Date | null
+  lastActiveAt: Date
+  inactiveWarnedAt: Date | null
+  inactiveFinalAt: Date | null
   _count: { strips: number; payments: number; feedbacks: number; supportTickets: number }
 }
 
@@ -75,12 +80,24 @@ export function serializeAdminUser(u: AdminUserRowInput) {
     location: placeLabel(u),
     createdAt: u.createdAt.toISOString(),
     updatedAt: u.updatedAt.toISOString(),
+    /** Last sign-in or refresh, day precision (lib/activity.ts). */
+    lastActiveAt: u.lastActiveAt.toISOString(),
+    inactivity: serializeSchedule(inactivitySchedule(u)),
     counts: {
       strips: u._count.strips,
       payments: u._count.payments,
       feedbacks: u._count.feedbacks,
       supportTickets: u._count.supportTickets,
     },
+  }
+}
+
+function serializeSchedule(schedule: InactivitySchedule) {
+  return {
+    state: schedule.state,
+    warnOn: schedule.warnOn?.toISOString() ?? null,
+    deleteOn: schedule.deleteOn?.toISOString() ?? null,
+    enabled: schedule.enabled,
   }
 }
 
@@ -95,9 +112,21 @@ export interface AdminPaymentInput {
   createdAt: Date
   updatedAt: Date
   paidAt: Date | null
+  /** gopay | shopeepay | qris — what a refund goes back to, and how long it can wait. */
+  paymentType: string | null
+  refundedAt: Date | null
+  refundReason: string | null
+  /** The admin who refunded it; null for a Midtrans-dashboard refund. */
+  refundedBy: UserSummaryInput | null
   /** Null once the payer deleted their account (the payment is kept). */
   user: UserSummaryInput | null
-  _count: { strips: number }
+  /** Priced with the partner buy 1 get 1 (docs/PLAN-promos.md). */
+  bogo: boolean
+  /** How many scrapbook bundles (one scrapbook + 3 strips) priced it. */
+  bundles: number
+  /** The payment method's admin fee, already inside `grossAmount`; 0 for none. */
+  adminFee: number
+  _count: { strips: number; scrapbooks: number }
 }
 
 /** A payment row for the admin transactions table. */
@@ -110,9 +139,19 @@ export function serializeAdminPayment(p: AdminPaymentInput) {
     status: p.status,
     midtransStatus: p.midtransStatus,
     stripCount: p._count.strips,
+    // Strips and scrapbooks can share one order (since 2026-10-17): the portal's items column.
+    scrapbookCount: p._count.scrapbooks,
+    // The promos that priced it, as tags beside the items (docs/PLAN-promos.md §7).
+    bogo: p.bogo,
+    bundled: p.bundles,
+    adminFee: p.adminFee,
     user: p.user ? serializeUserSummary(p.user) : null,
     createdAt: p.createdAt.toISOString(),
     paidAt: p.paidAt ? p.paidAt.toISOString() : null,
+    paymentType: p.paymentType,
+    refundedAt: p.refundedAt ? p.refundedAt.toISOString() : null,
+    refundReason: p.refundReason,
+    refundedBy: p.refundedBy ? serializeUserSummary(p.refundedBy) : null,
   }
 }
 
@@ -185,6 +224,15 @@ export interface AdminSupportTicketInput {
   createdAt: Date
   resolvedAt: Date | null
   user: UserSummaryInput | null
+  replies: AdminSupportReplyInput[]
+}
+
+export interface AdminSupportReplyInput {
+  id: string
+  message: string
+  sentTo: string
+  createdAt: Date
+  sentBy: UserSummaryInput | null
 }
 
 /** A help request for the admin support inbox. */
@@ -202,6 +250,13 @@ export function serializeAdminSupportTicket(t: AdminSupportTicketInput) {
     user: t.user ? serializeUserSummary(t.user) : null,
     createdAt: t.createdAt.toISOString(),
     resolvedAt: t.resolvedAt ? t.resolvedAt.toISOString() : null,
+    replies: t.replies.map((r) => ({
+      id: r.id,
+      message: r.message,
+      sentTo: r.sentTo,
+      sentBy: r.sentBy ? serializeUserSummary(r.sentBy) : null,
+      createdAt: r.createdAt.toISOString(),
+    })),
   }
 }
 
